@@ -22,6 +22,8 @@ class Config(arm.Config):
     prime_stream_s: float = 1.0
     offboard_retry_interval_s: float = 0.1
     offboard_timeout_s: float = 12.0
+    rearm_retry_interval_s: float = 0.75
+    arm_grace_s: float = 2.0
     handoff_altitude_window_m: float = 1.5
     handoff_vertical_speed_window_mps: float = 0.7
     handoff_ground_speed_window_mps: float = 1.5
@@ -164,6 +166,10 @@ def hover_state(state: arm.VehicleState, target_altitude_m: Optional[float], con
     return "NOT_ARMED"
 
 
+def armed_effective(state: arm.VehicleState, armed_latched_until_s: float, now_s: float) -> bool:
+    return state.armed or now_s <= armed_latched_until_s
+
+
 def handoff_ready(state: arm.VehicleState, target_altitude_m: Optional[float], config: Config) -> bool:
     if not state.armed:
         return False
@@ -189,10 +195,16 @@ def print_status(
     now_s: float,
     target_altitude_m: Optional[float],
     thrust: Optional[float],
+    armed_override: Optional[bool] = None,
 ) -> None:
+    armed_now = state.armed if armed_override is None else armed_override
+    hover_text = hover_state(state, target_altitude_m, config)
+    if armed_override is True and hover_text == "NOT_ARMED":
+        hover_text = "RECOVERING"
     line = (
-        f"{phase_name(stage)} hover_state={hover_state(state, target_altitude_m, config)} "
+        f"{phase_name(stage)} hover_state={hover_text} "
         f"{arm.status_line(state, config, now_s)} "
+        f"armed_effective={armed_now} "
         f"target_alt_m={arm.format_number(target_altitude_m)} "
         f"alt_err_m={altitude_error_m(state, target_altitude_m):.2f} "
         f"vel_age={velocity_age_text(state, now_s)} "
@@ -239,11 +251,16 @@ def recover_and_handoff(master, state: arm.VehicleState, config: Config, target_
     last_offboard_request_s = 0.0
     stable_since_s: Optional[float] = None
     last_max_thrust_s: Optional[float] = None
+    last_rearm_attempt_s: Optional[float] = None
     altctl_requested = False
+    armed_latched_until_s = recovery_started_s + config.arm_grace_s
 
     while True:
         now_s = time.monotonic()
         thrust = stream_recovery_cycle(master, state, config, recovery_started_s, target_altitude_m)
+
+        if state.armed:
+            armed_latched_until_s = now_s + config.arm_grace_s
 
         if thrust >= config.max_thrust - 1e-6:
             last_max_thrust_s = last_max_thrust_s or now_s
@@ -283,12 +300,29 @@ def recover_and_handoff(master, state: arm.VehicleState, config: Config, target_
                 stage = "CATCH"
             else:
                 stage = "STABILIZE"
-            print_status(stage, state, config, now_s, target_altitude_m, thrust)
+            print_status(
+                stage,
+                state,
+                config,
+                now_s,
+                target_altitude_m,
+                thrust,
+                armed_override=armed_effective(state, armed_latched_until_s, now_s),
+            )
             last_status_s = now_s
 
-        if not state.armed:
-            print("vehicle disarmed, stopping recovery stream")
-            return 1
+        if not armed_effective(state, armed_latched_until_s, now_s):
+            within_grace = now_s - recovery_started_s <= config.arm_grace_s
+            still_falling = (state.downward_speed_mps or 0.0) >= config.freefall_speed_mps * 0.5
+            if within_grace or still_falling:
+                if last_rearm_attempt_s is None or now_s - last_rearm_attempt_s >= config.rearm_retry_interval_s:
+                    print("vehicle not armed yet, retrying force-arm while streaming")
+                    if arm.force_arm(master, state, config):
+                        armed_latched_until_s = time.monotonic() + config.arm_grace_s
+                    last_rearm_attempt_s = now_s
+            else:
+                print("vehicle disarmed, stopping recovery stream")
+                return 1
 
         if recovery_deadline_s is not None and now_s >= recovery_deadline_s:
             print("recovery duration reached, stopping recovery stream")
@@ -386,6 +420,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prime-stream", type=float, default=Config.prime_stream_s, help="How long to stream before arming.")
     parser.add_argument("--offboard-retry-interval", type=float, default=Config.offboard_retry_interval_s, help="How often to re-request Offboard.")
     parser.add_argument("--offboard-timeout", type=float, default=Config.offboard_timeout_s, help="How long to wait before warning that Offboard is still not confirmed.")
+    parser.add_argument("--rearm-retry-interval", type=float, default=Config.rearm_retry_interval_s, help="How often to retry force-arm if PX4 drops back to disarmed during the catch.")
+    parser.add_argument("--arm-grace", type=float, default=Config.arm_grace_s, help="How long to tolerate and retry an unarmed state right after recovery starts.")
     parser.add_argument("--handoff-altitude-window", type=float, default=Config.handoff_altitude_window_m, help="Altitude error window for ALTCTL handoff.")
     parser.add_argument("--handoff-vertical-speed-window", type=float, default=Config.handoff_vertical_speed_window_mps, help="Vertical speed window for ALTCTL handoff.")
     parser.add_argument("--handoff-ground-speed-window", type=float, default=Config.handoff_ground_speed_window_mps, help="Ground speed window for ALTCTL handoff.")
@@ -412,6 +448,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         prime_stream_s=args.prime_stream,
         offboard_retry_interval_s=args.offboard_retry_interval,
         offboard_timeout_s=args.offboard_timeout,
+        rearm_retry_interval_s=args.rearm_retry_interval,
+        arm_grace_s=args.arm_grace,
         handoff_altitude_window_m=args.handoff_altitude_window,
         handoff_vertical_speed_window_mps=args.handoff_vertical_speed_window,
         handoff_ground_speed_window_mps=args.handoff_ground_speed_window,

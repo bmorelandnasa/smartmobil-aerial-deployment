@@ -38,6 +38,7 @@ class Config:
     telemetry_timeout_s: float = 0.5
     status_interval_s: float = 0.5
     ack_timeout_s: float = 2.0
+    arm_confirm_timeout_s: float = 1.5
     history_window_s: float = 2.0
 
 
@@ -214,6 +215,15 @@ def wait_for_ack(master, state: VehicleState, config: Config, command_id: int) -
     return False
 
 
+def wait_for_armed(master, state: VehicleState, config: Config, timeout_s: Optional[float] = None) -> bool:
+    deadline_s = time.monotonic() + (config.arm_confirm_timeout_s if timeout_s is None else timeout_s)
+    while time.monotonic() < deadline_s:
+        update_state(master, state, config, timeout_s=min(0.1, deadline_s - time.monotonic()))
+        if state.armed:
+            return True
+    return state.armed
+
+
 def send_arm_command(master, force: bool) -> None:
     force_value = FORCE_ARM_MAGIC if force else 0
     master.mav.command_long_send(
@@ -235,6 +245,11 @@ def force_arm(master, state: VehicleState, config: Config) -> bool:
     print("arm attempt: normal")
     send_arm_command(master, force=False)
     if wait_for_ack(master, state, config, MAVLINK.MAV_CMD_COMPONENT_ARM_DISARM) or state.armed:
+        if wait_for_armed(master, state, config):
+            print("arm accepted")
+            return True
+        print("arm not confirmed on heartbeat")
+    elif wait_for_armed(master, state, config, timeout_s=0.2):
         print("arm accepted")
         return True
 
@@ -242,6 +257,11 @@ def force_arm(master, state: VehicleState, config: Config) -> bool:
     print("arm attempt: force")
     send_arm_command(master, force=True)
     if wait_for_ack(master, state, config, MAVLINK.MAV_CMD_COMPONENT_ARM_DISARM) or state.armed:
+        if wait_for_armed(master, state, config):
+            print("force-arm accepted")
+            return True
+        print("force-arm not confirmed on heartbeat")
+    elif wait_for_armed(master, state, config, timeout_s=0.2):
         print("force-arm accepted")
         return True
 
