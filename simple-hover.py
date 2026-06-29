@@ -9,19 +9,19 @@ import simple_arm as arm
 
 @dataclass
 class Config(arm.Config):
-    stream_rate_hz: float = 20.0
-    prime_stream_s: float = 1.0
+    stream_rate_hz: float = 50.0
+    prime_stream_s: float = 0.2
     recovery_duration_s: float = 8.0
-    hover_thrust: float = 0.72
-    catch_thrust: float = 0.98
+    hover_thrust: float = 0.78
+    catch_thrust: float = 1.0
     min_thrust: float = 0.65
     max_thrust: float = 1.0
-    descent_gain: float = 0.06
-    catch_duration_s: float = 1.5
+    descent_gain: float = 0.08
+    catch_duration_s: float = 2.0
     roll_rate_rad_s: float = 0.0
     pitch_rate_rad_s: float = 0.0
     yaw_rate_rad_s: float = 0.0
-    offboard_retry_interval_s: float = 0.5
+    offboard_retry_interval_s: float = 0.1
     offboard_timeout_s: float = 3.0
 
 
@@ -40,11 +40,13 @@ def commanded_thrust(state: arm.VehicleState, config: Config, recovery_started_s
 
 
 def send_hover_setpoint(master, config: Config, thrust: float) -> None:
+    # Command a level attitude and let thrust do the recovery work.
+    # This is simpler and more useful in SITL than "hold current attitude".
     master.mav.set_attitude_target_send(
         int(time.monotonic() * 1000.0) & 0xFFFFFFFF,
         master.target_system,
         master.target_component,
-        arm.MAVLINK.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE,
+        1 | 2 | 4,
         [1.0, 0.0, 0.0, 0.0],
         config.roll_rate_rad_s,
         config.pitch_rate_rad_s,
@@ -54,38 +56,20 @@ def send_hover_setpoint(master, config: Config, thrust: float) -> None:
 
 
 def request_offboard_mode(master) -> None:
-    mapping = {}
-    if hasattr(master, "mode_mapping"):
-        try:
-            mapping = master.mode_mapping() or {}
-        except TypeError:
-            mapping = {}
-
-    offboard_mode = mapping.get("OFFBOARD") if mapping else None
-    if offboard_mode is not None and hasattr(master, "set_mode"):
-        master.set_mode(offboard_mode)
-        return
-
-    if hasattr(master.mav, "set_mode_send"):
-        master.mav.set_mode_send(
-            master.target_system,
-            arm.MAVLINK.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            arm.MAVLINK.PX4_CUSTOM_MAIN_MODE_OFFBOARD,
-        )
-        return
-
+    # Send the PX4 offboard mode command directly so this does not depend
+    # on how a given pymavlink build represents mode mappings.
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
         arm.MAVLINK.MAV_CMD_DO_SET_MODE,
         0,
-        arm.MAVLINK.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        arm.MAVLINK.PX4_CUSTOM_MAIN_MODE_OFFBOARD,
-        0,
-        0,
-        0,
-        0,
-        0,
+        float(arm.MAVLINK.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+        float(arm.MAVLINK.PX4_CUSTOM_MAIN_MODE_OFFBOARD),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
     )
 
 
