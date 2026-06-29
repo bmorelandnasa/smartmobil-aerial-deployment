@@ -27,6 +27,7 @@ class _FallbackMavlink:
 
 
 MAVLINK = mavutil.mavlink if mavutil is not None else _FallbackMavlink()
+PX4_CUSTOM_MAIN_MODE_OFFBOARD = getattr(MAVLINK, "PX4_CUSTOM_MAIN_MODE_OFFBOARD", 6)
 
 
 @dataclass
