@@ -64,7 +64,7 @@ def request_offboard_mode(master) -> None:
         arm.MAVLINK.MAV_CMD_DO_SET_MODE,
         0,
         float(arm.MAVLINK.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
-        float(arm.MAVLINK.PX4_CUSTOM_MAIN_MODE_OFFBOARD),
+        float(arm.PX4_CUSTOM_MAIN_MODE_OFFBOARD),
         0.0,
         0.0,
         0.0,
