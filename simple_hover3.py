@@ -46,6 +46,30 @@ def velocity_age_text(state: arm.VehicleState, now_s: float) -> str:
     return f"{now_s - state.velocity_time_s:.2f}s"
 
 
+def velocity_fresh(state: arm.VehicleState, config: Config, now_s: float) -> bool:
+    if state.velocity_time_s is None:
+        return True
+    return arm.velocity_is_fresh(state, config, now_s)
+
+
+def altitude_fresh(state: arm.VehicleState, config: Config, now_s: float) -> bool:
+    if state.altitude_time_s is None:
+        return True
+    return arm.altitude_is_fresh(state, config, now_s)
+
+
+def effective_downward_speed(state: arm.VehicleState, config: Config, now_s: float) -> float:
+    if not velocity_fresh(state, config, now_s):
+        return 0.0
+    return state.downward_speed_mps or 0.0
+
+
+def effective_ground_speed(state: arm.VehicleState, config: Config, now_s: float) -> float:
+    if not velocity_fresh(state, config, now_s):
+        return 0.0
+    return state.ground_speed_mps or 0.0
+
+
 def vertical_accel_mps2(state: arm.VehicleState) -> float:
     history = list(state.speed_history)
     if len(history) < 2:
@@ -55,15 +79,17 @@ def vertical_accel_mps2(state: arm.VehicleState) -> float:
     dt = newer.time_s - older.time_s
     if dt <= 0.0:
         return 0.0
+    if dt > 0.3:
+        return 0.0
     return (newer.downward_speed_mps - older.downward_speed_mps) / dt
 
 
-def capture_target_altitude(state: arm.VehicleState) -> Optional[float]:
-    return state.altitude_m
+def capture_target_altitude(state: arm.VehicleState) -> tuple[Optional[float], Optional[str]]:
+    return state.altitude_m, state.altitude_source
 
 
-def altitude_error_m(state: arm.VehicleState, target_altitude_m: Optional[float]) -> float:
-    if target_altitude_m is None or state.altitude_m is None:
+def altitude_error_m(state: arm.VehicleState, target_altitude_m: Optional[float], config: Config, now_s: float) -> float:
+    if target_altitude_m is None or state.altitude_m is None or not altitude_fresh(state, config, now_s):
         return 0.0
     return target_altitude_m - state.altitude_m
 
@@ -75,9 +101,12 @@ def thrust_command(
     now_s: float,
     target_altitude_m: Optional[float],
 ) -> float:
-    down_speed = state.downward_speed_mps or 0.0
+    if not velocity_fresh(state, config, now_s):
+        return config.hover_thrust
+
+    down_speed = effective_downward_speed(state, config, now_s)
     down_accel = max(0.0, vertical_accel_mps2(state))
-    alt_error = altitude_error_m(state, target_altitude_m)
+    alt_error = altitude_error_m(state, target_altitude_m, config, now_s)
 
     if now_s - recovery_started_s < config.catch_duration_s and down_speed > 0.5:
         thrust = (
@@ -156,7 +185,8 @@ def altctl_active(state: arm.VehicleState) -> bool:
 
 
 def hover_state(state: arm.VehicleState, target_altitude_m: Optional[float], config: Config) -> str:
-    alt_ok = abs(altitude_error_m(state, target_altitude_m)) <= config.handoff_altitude_window_m
+    now_s = time.monotonic()
+    alt_ok = abs(altitude_error_m(state, target_altitude_m, config, now_s)) <= config.handoff_altitude_window_m
     vertical_ok = state.downward_speed_mps is not None and abs(state.downward_speed_mps) <= config.handoff_vertical_speed_window_mps
     ground_ok = state.ground_speed_mps is not None and state.ground_speed_mps <= config.handoff_ground_speed_window_mps
     if state.armed and alt_ok and vertical_ok and ground_ok:
@@ -171,11 +201,14 @@ def armed_effective(state: arm.VehicleState, armed_latched_until_s: float, now_s
 
 
 def handoff_ready(state: arm.VehicleState, target_altitude_m: Optional[float], config: Config) -> bool:
+    now_s = time.monotonic()
     if not state.armed:
         return False
     if not offboard_active(state):
         return False
-    if abs(altitude_error_m(state, target_altitude_m)) > config.handoff_altitude_window_m:
+    if not velocity_fresh(state, config, now_s) or not altitude_fresh(state, config, now_s):
+        return False
+    if abs(altitude_error_m(state, target_altitude_m, config, now_s)) > config.handoff_altitude_window_m:
         return False
     if state.downward_speed_mps is None or abs(state.downward_speed_mps) > config.handoff_vertical_speed_window_mps:
         return False
@@ -206,7 +239,7 @@ def print_status(
         f"{arm.status_line(state, config, now_s)} "
         f"armed_effective={armed_now} "
         f"target_alt_m={arm.format_number(target_altitude_m)} "
-        f"alt_err_m={altitude_error_m(state, target_altitude_m):.2f} "
+        f"alt_err_m={altitude_error_m(state, target_altitude_m, config, now_s):.2f} "
         f"vel_age={velocity_age_text(state, now_s)} "
         f"last_text={arm.recent_status_text(state, now_s)}"
     )
@@ -254,10 +287,16 @@ def recover_and_handoff(master, state: arm.VehicleState, config: Config, target_
     last_rearm_attempt_s: Optional[float] = None
     altctl_requested = False
     armed_latched_until_s = recovery_started_s + config.arm_grace_s
+    target_source = state.altitude_source
 
     while True:
         now_s = time.monotonic()
         thrust = stream_recovery_cycle(master, state, config, recovery_started_s, target_altitude_m)
+
+        if target_source != "LOCAL_POSITION_NED" and state.altitude_source == "LOCAL_POSITION_NED" and altitude_fresh(state, config, now_s):
+            target_altitude_m = state.altitude_m
+            target_source = state.altitude_source
+            print(f"target altitude recaptured from {target_source}: {arm.format_number(target_altitude_m)} m")
 
         if state.armed:
             armed_latched_until_s = now_s + config.arm_grace_s
@@ -289,7 +328,7 @@ def recover_and_handoff(master, state: arm.VehicleState, config: Config, target_
             offboard_deadline_s = now_s + 1.0
 
         if last_max_thrust_s is not None and now_s - last_max_thrust_s >= config.max_thrust_warning_s:
-            if state.downward_speed_mps is not None and state.downward_speed_mps > config.handoff_vertical_speed_window_mps:
+            if effective_downward_speed(state, config, now_s) > config.handoff_vertical_speed_window_mps:
                 print("warning: thrust saturated at max and descent is not yet under control")
                 last_max_thrust_s = now_s
 
@@ -313,7 +352,7 @@ def recover_and_handoff(master, state: arm.VehicleState, config: Config, target_
 
         if not armed_effective(state, armed_latched_until_s, now_s):
             within_grace = now_s - recovery_started_s <= config.arm_grace_s
-            still_falling = (state.downward_speed_mps or 0.0) >= config.freefall_speed_mps * 0.5
+            still_falling = effective_downward_speed(state, config, now_s) >= config.freefall_speed_mps * 0.5
             if within_grace or still_falling:
                 if last_rearm_attempt_s is None or now_s - last_rearm_attempt_s >= config.rearm_retry_interval_s:
                     print("vehicle not armed yet, retrying force-arm while streaming")
@@ -389,10 +428,14 @@ def run(config: Config) -> int:
             continue
 
         print("trigger fired: freefall")
-        target_altitude_m = capture_target_altitude(state)
-        print(f"target altitude captured: {arm.format_number(target_altitude_m)} m")
+        target_altitude_m, target_source = capture_target_altitude(state)
+        print(f"target altitude captured: {arm.format_number(target_altitude_m)} m source={target_source or 'none'}")
 
         prepare_stream(master, state, config, target_altitude_m)
+
+        if state.altitude_source == "LOCAL_POSITION_NED" and arm.altitude_is_fresh(state, config, time.monotonic()):
+            target_altitude_m = state.altitude_m
+            print(f"target altitude refreshed before arm: {arm.format_number(target_altitude_m)} m source={state.altitude_source}")
 
         print("phase=ARMING")
         if not arm.force_arm(master, state, config):

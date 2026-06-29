@@ -55,6 +55,7 @@ class VehicleState:
     heartbeat_time_s: Optional[float] = None
     altitude_m: Optional[float] = None
     altitude_source: Optional[str] = None
+    altitude_time_s: Optional[float] = None
     downward_speed_mps: Optional[float] = None
     ground_speed_mps: Optional[float] = None
     velocity_source: Optional[str] = None
@@ -123,6 +124,7 @@ def process_message(master, state: VehicleState, config: Config, message, now_s:
     if message_type == "LOCAL_POSITION_NED":
         state.altitude_m = -float(getattr(message, "z", 0.0))
         state.altitude_source = "LOCAL_POSITION_NED"
+        state.altitude_time_s = now_s
         downward_speed_mps = float(getattr(message, "vz", 0.0))
         vx = float(getattr(message, "vx", 0.0))
         vy = float(getattr(message, "vy", 0.0))
@@ -134,8 +136,11 @@ def process_message(master, state: VehicleState, config: Config, message, now_s:
         return
 
     if message_type == "GLOBAL_POSITION_INT":
+        if state.velocity_source == "LOCAL_POSITION_NED" and velocity_is_fresh(state, config, now_s):
+            return
         state.altitude_m = float(getattr(message, "relative_alt", 0.0)) / 1000.0
         state.altitude_source = "GLOBAL_POSITION_INT"
+        state.altitude_time_s = now_s
         downward_speed_mps = float(getattr(message, "vz", 0.0)) / 100.0
         state.downward_speed_mps = downward_speed_mps
         state.ground_speed_mps = float(getattr(message, "vel", 0.0)) / 100.0
@@ -153,6 +158,10 @@ def append_speed_sample(state: VehicleState, config: Config, now_s: float, downw
 
 def velocity_is_fresh(state: VehicleState, config: Config, now_s: float) -> bool:
     return state.velocity_time_s is not None and now_s - state.velocity_time_s <= config.telemetry_timeout_s
+
+
+def altitude_is_fresh(state: VehicleState, config: Config, now_s: float) -> bool:
+    return state.altitude_time_s is not None and now_s - state.altitude_time_s <= config.telemetry_timeout_s
 
 
 def freefall_detected(state: VehicleState, config: Config, now_s: float) -> bool:
