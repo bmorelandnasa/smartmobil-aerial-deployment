@@ -16,7 +16,8 @@ class Config(arm.Config):
     catch_thrust: float = 1.0
     min_thrust: float = 0.65
     max_thrust: float = 1.0
-    descent_gain: float = 0.08
+    altitude_gain: float = 0.03
+    vertical_speed_gain: float = 0.08
     catch_duration_s: float = 2.0
     roll_rate_rad_s: float = 0.0
     pitch_rate_rad_s: float = 0.0
@@ -29,13 +30,30 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def commanded_thrust(state: arm.VehicleState, config: Config, recovery_started_s: float, now_s: float) -> float:
-    downward_speed = max(0.0, state.downward_speed_mps or 0.0)
+def altitude_error_m(state: arm.VehicleState, target_altitude_m: float | None) -> float:
+    if target_altitude_m is None or state.altitude_m is None:
+        return 0.0
+    return target_altitude_m - state.altitude_m
+
+
+def commanded_thrust(
+    state: arm.VehicleState,
+    config: Config,
+    recovery_started_s: float,
+    now_s: float,
+    target_altitude_m: float | None,
+) -> float:
+    downward_speed = state.downward_speed_mps or 0.0
+    altitude_error = altitude_error_m(state, target_altitude_m)
 
     if now_s - recovery_started_s < config.catch_duration_s and downward_speed > 0.5:
         return config.catch_thrust
 
-    thrust = config.hover_thrust + downward_speed * config.descent_gain
+    thrust = (
+        config.hover_thrust
+        + altitude_error * config.altitude_gain
+        + downward_speed * config.vertical_speed_gain
+    )
     return clamp(thrust, config.min_thrust, config.max_thrust)
 
 
@@ -83,6 +101,10 @@ def hover_status(state: arm.VehicleState, offboard_confirmed: bool) -> str:
     return "RECOVERING"
 
 
+def capture_target_altitude(state: arm.VehicleState) -> float | None:
+    return state.altitude_m
+
+
 def request_offboard_mode(master) -> None:
     # Send the PX4 offboard mode command directly so this does not depend
     # on how a given pymavlink build represents mode mappings.
@@ -105,9 +127,16 @@ def offboard_active(state: arm.VehicleState) -> bool:
     return state.mode.upper() == "OFFBOARD"
 
 
-def stream_cycle(master, state: arm.VehicleState, config: Config, recovery_started_s: float, request_offboard_now: bool) -> float:
+def stream_cycle(
+    master,
+    state: arm.VehicleState,
+    config: Config,
+    recovery_started_s: float,
+    target_altitude_m: float | None,
+    request_offboard_now: bool,
+) -> float:
     now_s = time.monotonic()
-    thrust = commanded_thrust(state, config, recovery_started_s, now_s)
+    thrust = commanded_thrust(state, config, recovery_started_s, now_s, target_altitude_m)
     send_hover_setpoint(master, config, thrust)
     arm.update_state(master, state, config, timeout_s=0.0)
     if request_offboard_now:
@@ -115,25 +144,27 @@ def stream_cycle(master, state: arm.VehicleState, config: Config, recovery_start
     return thrust
 
 
-def prime_stream(master, state: arm.VehicleState, config: Config, recovery_started_s: float) -> None:
+def prime_stream(master, state: arm.VehicleState, config: Config, recovery_started_s: float, target_altitude_m: float | None) -> None:
     interval_s = 1.0 / config.stream_rate_hz
     deadline_s = time.monotonic() + config.prime_stream_s
     last_status_s = 0.0
 
     while time.monotonic() < deadline_s:
         now_s = time.monotonic()
-        thrust = stream_cycle(master, state, config, recovery_started_s, request_offboard_now=False)
+        thrust = stream_cycle(master, state, config, recovery_started_s, target_altitude_m, request_offboard_now=False)
         if now_s - last_status_s >= config.status_interval_s:
             print(
                 f"phase=PREPARE hover_state=WAITING "
                 f"{arm.status_line(state, config, now_s)} "
+                f"target_alt_m={arm.format_number(target_altitude_m)} "
+                f"alt_err_m={altitude_error_m(state, target_altitude_m):.2f} "
                 f"vel_age={velocity_age_text(state, now_s)} thrust_cmd={thrust:.2f}"
             )
             last_status_s = now_s
         time.sleep(interval_s)
 
 
-def hold_recovery(master, state: arm.VehicleState, config: Config, recovery_started_s: float) -> int:
+def hold_recovery(master, state: arm.VehicleState, config: Config, recovery_started_s: float, target_altitude_m: float | None) -> int:
     interval_s = 1.0 / config.stream_rate_hz
     last_status_s = 0.0
     last_offboard_request_s = 0.0
@@ -145,7 +176,7 @@ def hold_recovery(master, state: arm.VehicleState, config: Config, recovery_star
     while True:
         now_s = time.monotonic()
         request_now = not offboard_confirmed and now_s - last_offboard_request_s >= config.offboard_retry_interval_s
-        thrust = stream_cycle(master, state, config, recovery_started_s, request_offboard_now=request_now)
+        thrust = stream_cycle(master, state, config, recovery_started_s, target_altitude_m, request_offboard_now=request_now)
         if request_now:
             last_offboard_request_s = now_s
 
@@ -162,6 +193,8 @@ def hold_recovery(master, state: arm.VehicleState, config: Config, recovery_star
                 f"phase={recovery_phase(recovery_started_s, now_s, offboard_confirmed, state, config)} "
                 f"hover_state={hover_status(state, offboard_confirmed)} "
                 f"{arm.status_line(state, config, now_s)} "
+                f"target_alt_m={arm.format_number(target_altitude_m)} "
+                f"alt_err_m={altitude_error_m(state, target_altitude_m):.2f} "
                 f"vel_age={velocity_age_text(state, now_s)} thrust_cmd={thrust:.2f}"
             )
             last_status_s = now_s
@@ -187,7 +220,8 @@ def run(config: Config) -> int:
         "hover recovery: "
         f"hover_thrust={config.hover_thrust:.2f} "
         f"catch_thrust={config.catch_thrust:.2f} "
-        f"gain={config.descent_gain:.3f} "
+        f"alt_gain={config.altitude_gain:.3f} "
+        f"vs_gain={config.vertical_speed_gain:.3f} "
         f"duration={config.recovery_duration_s:.1f}s"
     )
 
@@ -205,13 +239,15 @@ def run(config: Config) -> int:
         print("trigger fired: freefall")
         print("streaming setpoints before arming")
         recovery_started_s = time.monotonic()
-        prime_stream(master, state, config, recovery_started_s)
+        target_altitude_m = capture_target_altitude(state)
+        print(f"target altitude captured: {arm.format_number(target_altitude_m)} m")
+        prime_stream(master, state, config, recovery_started_s, target_altitude_m)
 
         if not arm.force_arm(master, state, config):
             return 1
 
         print("recovery streaming active")
-        return hold_recovery(master, state, config, recovery_started_s)
+        return hold_recovery(master, state, config, recovery_started_s, target_altitude_m)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -222,7 +258,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status-interval", type=float, default=Config.status_interval_s, help="Status print interval in seconds.")
     parser.add_argument("--hover-thrust", type=float, default=Config.hover_thrust, help="Base thrust after the initial catch.")
     parser.add_argument("--catch-thrust", type=float, default=Config.catch_thrust, help="High thrust used right after rearming during a fast fall.")
-    parser.add_argument("--descent-gain", type=float, default=Config.descent_gain, help="Extra thrust per m/s of downward speed.")
+    parser.add_argument("--altitude-gain", type=float, default=Config.altitude_gain, help="Extra thrust per meter below the captured target altitude.")
+    parser.add_argument("--vertical-speed-gain", type=float, default=Config.vertical_speed_gain, help="Extra thrust per m/s of downward speed and less thrust when climbing.")
     parser.add_argument("--catch-duration", type=float, default=Config.catch_duration_s, help="How long to hold catch thrust after trigger.")
     parser.add_argument("--stream-rate", type=float, default=Config.stream_rate_hz, help="Offboard setpoint stream rate in Hz.")
     parser.add_argument("--prime-stream", type=float, default=Config.prime_stream_s, help="How long to stream before arm/offboard commands.")
@@ -238,7 +275,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         status_interval_s=args.status_interval,
         hover_thrust=args.hover_thrust,
         catch_thrust=args.catch_thrust,
-        descent_gain=args.descent_gain,
+        altitude_gain=args.altitude_gain,
+        vertical_speed_gain=args.vertical_speed_gain,
         catch_duration_s=args.catch_duration,
         stream_rate_hz=args.stream_rate,
         prime_stream_s=args.prime_stream,
