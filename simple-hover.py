@@ -10,8 +10,8 @@ import simple_arm as arm
 @dataclass
 class Config(arm.Config):
     stream_rate_hz: float = 50.0
-    prime_stream_s: float = 0.2
-    recovery_duration_s: float = 8.0
+    prime_stream_s: float = 1.0
+    recovery_duration_s: float = 0.0
     hover_thrust: float = 0.78
     catch_thrust: float = 1.0
     min_thrust: float = 0.65
@@ -22,7 +22,7 @@ class Config(arm.Config):
     pitch_rate_rad_s: float = 0.0
     yaw_rate_rad_s: float = 0.0
     offboard_retry_interval_s: float = 0.1
-    offboard_timeout_s: float = 3.0
+    offboard_timeout_s: float = 10.0
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -55,6 +55,34 @@ def send_hover_setpoint(master, config: Config, thrust: float) -> None:
     )
 
 
+def velocity_age_text(state: arm.VehicleState, now_s: float) -> str:
+    if state.velocity_time_s is None:
+        return "n/a"
+    return f"{now_s - state.velocity_time_s:.2f}s"
+
+
+def recovery_phase(recovery_started_s: float, now_s: float, offboard_confirmed: bool, state: arm.VehicleState, config: Config) -> str:
+    if not state.armed:
+        return "ARMING"
+    if not offboard_confirmed:
+        return "OFFBOARD_WAIT"
+    if now_s - recovery_started_s < config.catch_duration_s:
+        return "CATCHING"
+    return "HOLDING"
+
+
+def hover_status(state: arm.VehicleState, offboard_confirmed: bool) -> str:
+    if not state.armed:
+        return "NOT_ARMED"
+    if not offboard_confirmed:
+        return "OFFBOARD_NOT_CONFIRMED"
+    vertical_ok = state.downward_speed_mps is not None and abs(state.downward_speed_mps) <= 0.7
+    lateral_ok = state.ground_speed_mps is not None and state.ground_speed_mps <= 1.5
+    if vertical_ok and lateral_ok:
+        return "HOVER_STABLE"
+    return "RECOVERING"
+
+
 def request_offboard_mode(master) -> None:
     # Send the PX4 offboard mode command directly so this does not depend
     # on how a given pymavlink build represents mode mappings.
@@ -73,43 +101,80 @@ def request_offboard_mode(master) -> None:
     )
 
 
-def stream_for_time(master, state: arm.VehicleState, config: Config, duration_s: float, recovery_started_s: float, request_offboard: bool) -> None:
-    interval_s = 1.0 / config.stream_rate_hz
-    deadline_s = time.monotonic() + duration_s
-    last_status_s = 0.0
-    last_offboard_request_s = 0.0
-
-    while time.monotonic() < deadline_s:
-        now_s = time.monotonic()
-        thrust = commanded_thrust(state, config, recovery_started_s, now_s)
-        send_hover_setpoint(master, config, thrust)
-        arm.update_state(master, state, config, timeout_s=0.0)
-
-        if request_offboard and now_s - last_offboard_request_s >= config.offboard_retry_interval_s:
-            request_offboard_mode(master)
-            last_offboard_request_s = now_s
-
-        if now_s - last_status_s >= config.status_interval_s:
-            print(f"{arm.status_line(state, config, now_s)} thrust_cmd={thrust:.2f}")
-            last_status_s = now_s
-
-        time.sleep(interval_s)
-
-
 def offboard_active(state: arm.VehicleState) -> bool:
     return state.mode.upper() == "OFFBOARD"
 
 
-def enter_offboard(master, state: arm.VehicleState, config: Config, recovery_started_s: float) -> bool:
-    deadline_s = time.monotonic() + config.offboard_timeout_s
-    while time.monotonic() < deadline_s:
+def stream_cycle(master, state: arm.VehicleState, config: Config, recovery_started_s: float, request_offboard_now: bool) -> float:
+    now_s = time.monotonic()
+    thrust = commanded_thrust(state, config, recovery_started_s, now_s)
+    send_hover_setpoint(master, config, thrust)
+    arm.update_state(master, state, config, timeout_s=0.0)
+    if request_offboard_now:
         request_offboard_mode(master)
-        stream_for_time(master, state, config, config.offboard_retry_interval_s, recovery_started_s, request_offboard=False)
-        if offboard_active(state):
+    return thrust
+
+
+def prime_stream(master, state: arm.VehicleState, config: Config, recovery_started_s: float) -> None:
+    interval_s = 1.0 / config.stream_rate_hz
+    deadline_s = time.monotonic() + config.prime_stream_s
+    last_status_s = 0.0
+
+    while time.monotonic() < deadline_s:
+        now_s = time.monotonic()
+        thrust = stream_cycle(master, state, config, recovery_started_s, request_offboard_now=False)
+        if now_s - last_status_s >= config.status_interval_s:
+            print(
+                f"phase=PREPARE hover_state=WAITING "
+                f"{arm.status_line(state, config, now_s)} "
+                f"vel_age={velocity_age_text(state, now_s)} thrust_cmd={thrust:.2f}"
+            )
+            last_status_s = now_s
+        time.sleep(interval_s)
+
+
+def hold_recovery(master, state: arm.VehicleState, config: Config, recovery_started_s: float) -> int:
+    interval_s = 1.0 / config.stream_rate_hz
+    last_status_s = 0.0
+    last_offboard_request_s = 0.0
+    last_offboard_warning_s = 0.0
+    offboard_confirmed = False
+    offboard_deadline_s = time.monotonic() + config.offboard_timeout_s
+    recovery_deadline_s = None if config.recovery_duration_s <= 0 else time.monotonic() + config.recovery_duration_s
+
+    while True:
+        now_s = time.monotonic()
+        request_now = not offboard_confirmed and now_s - last_offboard_request_s >= config.offboard_retry_interval_s
+        thrust = stream_cycle(master, state, config, recovery_started_s, request_offboard_now=request_now)
+        if request_now:
+            last_offboard_request_s = now_s
+
+        if offboard_active(state) and not offboard_confirmed:
+            offboard_confirmed = True
             print("offboard accepted")
-            return True
-    print("offboard denied")
-    return False
+
+        if not offboard_confirmed and now_s >= offboard_deadline_s and now_s - last_offboard_warning_s >= 1.0:
+            print("offboard not confirmed yet, still streaming and retrying")
+            last_offboard_warning_s = now_s
+
+        if now_s - last_status_s >= config.status_interval_s:
+            print(
+                f"phase={recovery_phase(recovery_started_s, now_s, offboard_confirmed, state, config)} "
+                f"hover_state={hover_status(state, offboard_confirmed)} "
+                f"{arm.status_line(state, config, now_s)} "
+                f"vel_age={velocity_age_text(state, now_s)} thrust_cmd={thrust:.2f}"
+            )
+            last_status_s = now_s
+
+        if not state.armed:
+            print("vehicle disarmed, stopping recovery stream")
+            return 0
+
+        if recovery_deadline_s is not None and now_s >= recovery_deadline_s:
+            print("recovery duration reached, stopping recovery stream")
+            return 0
+
+        time.sleep(interval_s)
 
 
 def run(config: Config) -> int:
@@ -131,7 +196,7 @@ def run(config: Config) -> int:
         now_s = time.monotonic()
 
         if now_s - last_status_s >= config.status_interval_s:
-            print(arm.status_line(state, config, now_s))
+            print(f"phase=WAITING hover_state=IDLE {arm.status_line(state, config, now_s)} vel_age={velocity_age_text(state, now_s)}")
             last_status_s = now_s
 
         if not arm.freefall_detected(state, config, now_s):
@@ -140,18 +205,13 @@ def run(config: Config) -> int:
         print("trigger fired: freefall")
         print("streaming setpoints before arming")
         recovery_started_s = time.monotonic()
-        stream_for_time(master, state, config, config.prime_stream_s, recovery_started_s, request_offboard=False)
+        prime_stream(master, state, config, recovery_started_s)
 
         if not arm.force_arm(master, state, config):
             return 1
 
-        if not enter_offboard(master, state, config, recovery_started_s):
-            return 1
-
         print("recovery streaming active")
-        stream_for_time(master, state, config, config.recovery_duration_s, recovery_started_s, request_offboard=True)
-        print("recovery streaming stopped")
-        return 0
+        return hold_recovery(master, state, config, recovery_started_s)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -166,7 +226,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--catch-duration", type=float, default=Config.catch_duration_s, help="How long to hold catch thrust after trigger.")
     parser.add_argument("--stream-rate", type=float, default=Config.stream_rate_hz, help="Offboard setpoint stream rate in Hz.")
     parser.add_argument("--prime-stream", type=float, default=Config.prime_stream_s, help="How long to stream before arm/offboard commands.")
-    parser.add_argument("--recovery-duration", type=float, default=Config.recovery_duration_s, help="How long to keep recovery active.")
+    parser.add_argument("--recovery-duration", type=float, default=Config.recovery_duration_s, help="How long to keep recovery active. Use 0 to hold until disarm/manual takeover.")
     return parser
 
 

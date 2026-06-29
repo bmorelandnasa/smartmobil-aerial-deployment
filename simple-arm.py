@@ -52,6 +52,8 @@ class VehicleState:
     armed: bool = False
     mode: str = "UNKNOWN"
     heartbeat_time_s: Optional[float] = None
+    altitude_m: Optional[float] = None
+    altitude_source: Optional[str] = None
     downward_speed_mps: Optional[float] = None
     ground_speed_mps: Optional[float] = None
     velocity_source: Optional[str] = None
@@ -102,6 +104,8 @@ def process_message(master, state: VehicleState, config: Config, message, now_s:
         return
 
     if message_type == "LOCAL_POSITION_NED":
+        state.altitude_m = -float(getattr(message, "z", 0.0))
+        state.altitude_source = "LOCAL_POSITION_NED"
         downward_speed_mps = float(getattr(message, "vz", 0.0))
         vx = float(getattr(message, "vx", 0.0))
         vy = float(getattr(message, "vy", 0.0))
@@ -113,6 +117,8 @@ def process_message(master, state: VehicleState, config: Config, message, now_s:
         return
 
     if message_type == "GLOBAL_POSITION_INT":
+        state.altitude_m = float(getattr(message, "relative_alt", 0.0)) / 1000.0
+        state.altitude_source = "GLOBAL_POSITION_INT"
         downward_speed_mps = float(getattr(message, "vz", 0.0)) / 100.0
         state.downward_speed_mps = downward_speed_mps
         state.ground_speed_mps = float(getattr(message, "vel", 0.0)) / 100.0
@@ -158,6 +164,8 @@ def status_line(state: VehicleState, config: Config, now_s: float) -> str:
         f"heartbeat={'fresh' if heartbeat_fresh else 'stale'} "
         f"armed={state.armed} "
         f"mode={state.mode} "
+        f"alt_m={format_number(state.altitude_m)} "
+        f"alt_src={state.altitude_source or 'none'} "
         f"source={state.velocity_source or 'none'} "
         f"down_mps={format_number(state.downward_speed_mps)} "
         f"ground_mps={format_number(state.ground_speed_mps)}"
