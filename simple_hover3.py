@@ -30,6 +30,9 @@ class Config(arm.Config):
     hover_altitude_window_m: float = 2.0
     hover_vertical_speed_window_mps: float = 0.7
     hover_ground_speed_window_mps: float = 1.5
+    roll_rate_rad_s: float = 0.0
+    pitch_rate_rad_s: float = 0.0
+    yaw_rate_rad_s: float = 0.0
 
 
 def clamp(value: float, low: float, high: float) -> float:
