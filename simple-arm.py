@@ -147,10 +147,7 @@ def freefall_detected(state: VehicleState, config: Config, now_s: float) -> bool
     if not anchor or not trailing:
         return False
 
-    for sample in [anchor[-1], *trailing]:
-        if sample.downward_speed_mps < config.freefall_speed_mps:
-            return False
-    return True
+    return all(sample.downward_speed_mps >= config.freefall_speed_mps for sample in [anchor[-1], *trailing])
 
 
 def status_line(state: VehicleState, config: Config, now_s: float) -> str:
@@ -179,10 +176,7 @@ def wait_for_ack(master, state: VehicleState, config: Config, command_id: int) -
             continue
         result = getattr(message, "result", None)
         print(f"command ack: command={command_id} result={result}")
-        return result in (
-            MAVLINK.MAV_RESULT_ACCEPTED,
-            MAVLINK.MAV_RESULT_IN_PROGRESS,
-        )
+        return result in (MAVLINK.MAV_RESULT_ACCEPTED, MAVLINK.MAV_RESULT_IN_PROGRESS)
     print(f"command ack timeout: command={command_id}")
     return False
 
@@ -227,11 +221,7 @@ def run(config: Config) -> int:
     state = VehicleState()
     last_status_s = 0.0
 
-    print(
-        "freefall trigger: "
-        f"threshold={config.freefall_speed_mps:.2f}m/s "
-        f"duration={config.freefall_time_s:.2f}s"
-    )
+    print(f"freefall trigger: threshold={config.freefall_speed_mps:.2f}m/s duration={config.freefall_time_s:.2f}s")
 
     while True:
         update_state(master, state, config, timeout_s=0.1)
@@ -265,9 +255,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
 
 
 def cli() -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args()
-    return run(config_from_args(args))
+    return run(config_from_args(build_arg_parser().parse_args()))
 
 
 if __name__ == "__main__":
