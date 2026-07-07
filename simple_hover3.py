@@ -1,150 +1,96 @@
+"""Freefall recovery script that catches with Offboard thrust, then hands off to PX4 Hold."""
+
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
-import simple_arm4 as arm
+try:
+    from simple_pid import PID
+except ImportError:
+    PID = None
+
+import simple_arm3 as arm
 
 
 @dataclass
 class Config(arm.Config):
-    catch_thrust: float = 0.95
-    catch_duration_s: float = 1.2
-    hover_thrust: float = 0.72
-    min_thrust: float = 0.58
-    max_thrust: float = 0.95
-    altitude_gain: float = 0.025
-    vertical_speed_gain: float = 0.06
-    acceleration_gain: float = 0.015
-    stream_rate_hz: float = 60.0
-    prime_stream_s: float = 1.0
-    offboard_retry_interval_s: float = 0.1
-    offboard_timeout_s: float = 12.0
-    rearm_retry_interval_s: float = 0.75
-    arm_grace_s: float = 2.0
-    handoff_altitude_window_m: float = 1.5
-    handoff_vertical_speed_window_mps: float = 0.7
-    handoff_ground_speed_window_mps: float = 1.5
-    handoff_dwell_s: float = 1.0
-    recovery_duration_s: float = 0.0
-    runaway_up_speed_mps: float = 2.5
-    max_thrust_warning_s: float = 1.0
-    roll_rate_rad_s: float = 0.0
-    pitch_rate_rad_s: float = 0.0
-    yaw_rate_rad_s: float = 0.0
+    """All tunable recovery settings exposed through the CLI."""
+
+    stream_rate_hz: float = 50.0
+    recovery_thrust: float = 0.55
+    min_thrust: float = 0.20
+    max_thrust: float = 0.88
+    catch_thrust: float = 0.90
+    catch_duration_s: float = 0.25
+    target_vz_mps: float = 0.0
+    pid_kp: float = 0.045
+    pid_ki: float = 0.0
+    pid_kd: float = 0.025
+    recovery_duration_s: float = 10.0
+    offboard_retry_interval_s: float = 0.2
+    arm_retry_interval_s: float = 0.2
+    force_arm_burst_s: float = 2.0
+    tilt_moderate_deg: float = 35.0
+    tilt_bad_deg: float = 60.0
+    tilt_inverted_deg: float = 90.0
+    tilt_moderate_thrust_cap: float = 0.55
+    tilt_bad_thrust_cap: float = 0.35
+    tilt_inverted_thrust_cap: float = 0.15
+    handoff_max_tilt_deg: float = 25.0
+    handoff_max_rate_rad_s: float = 1.5
+    simulated_tilt_deg: Optional[float] = None
+    handoff_hold: bool = True
+    handoff_after_offboard_s: float = 0.5
+    handoff_vz_mps: float = 3.5
+    handoff_climb_limit_mps: float = -0.5
+    handoff_dwell_s: float = 0.0
+    handoff_min_altitude_m: float = 10.0
+    handoff_timeout_s: float = 2.0
+    handoff_retry_interval_s: float = 0.3
+    log_dir: str = "logs"
+    no_log: bool = False
 
 
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+class Tee:
+    """Write console output to both the terminal and a log file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+            stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
 
 
-def velocity_age_text(state: arm.VehicleState, now_s: float) -> str:
-    if state.velocity_time_s is None:
-        return "n/a"
-    return f"{now_s - state.velocity_time_s:.2f}s"
+def enable_logging(config: Config) -> None:
+    """Mirror stdout/stderr into a timestamped log file unless disabled."""
+
+    if config.no_log:
+        return
+    log_dir = Path(config.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"simple_hover3_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = path.open("w", encoding="utf-8", buffering=1)
+    sys.stdout = Tee(sys.__stdout__, log_file)
+    sys.stderr = Tee(sys.__stderr__, log_file)
+    print(f"log file: {path.resolve()}")
 
 
-def velocity_fresh(state: arm.VehicleState, config: Config, now_s: float) -> bool:
-    if state.velocity_time_s is None:
-        return True
-    return arm.velocity_is_fresh(state, config, now_s)
+def request_offboard(master) -> None:
+    """Ask PX4 to enter Offboard mode so our thrust setpoints are used."""
 
-
-def altitude_fresh(state: arm.VehicleState, config: Config, now_s: float) -> bool:
-    if state.altitude_time_s is None:
-        return True
-    return arm.altitude_is_fresh(state, config, now_s)
-
-
-def effective_downward_speed(state: arm.VehicleState, config: Config, now_s: float) -> float:
-    if not velocity_fresh(state, config, now_s):
-        return 0.0
-    return state.downward_speed_mps or 0.0
-
-
-def effective_ground_speed(state: arm.VehicleState, config: Config, now_s: float) -> float:
-    if not velocity_fresh(state, config, now_s):
-        return 0.0
-    return state.ground_speed_mps or 0.0
-
-
-def vertical_accel_mps2(state: arm.VehicleState) -> float:
-    history = list(state.speed_history)
-    if len(history) < 2:
-        return 0.0
-    older = history[-2]
-    newer = history[-1]
-    dt = newer.time_s - older.time_s
-    if dt <= 0.0:
-        return 0.0
-    if dt > 0.3:
-        return 0.0
-    return (newer.downward_speed_mps - older.downward_speed_mps) / dt
-
-
-def capture_target_altitude(state: arm.VehicleState) -> tuple[Optional[float], Optional[str]]:
-    return state.altitude_m, state.altitude_source
-
-
-def altitude_error_m(state: arm.VehicleState, target_altitude_m: Optional[float], config: Config, now_s: float) -> float:
-    if target_altitude_m is None or state.altitude_m is None or not altitude_fresh(state, config, now_s):
-        return 0.0
-    return target_altitude_m - state.altitude_m
-
-
-def thrust_command(
-    state: arm.VehicleState,
-    config: Config,
-    recovery_started_s: float,
-    now_s: float,
-    target_altitude_m: Optional[float],
-) -> float:
-    if not velocity_fresh(state, config, now_s):
-        return config.hover_thrust
-
-    down_speed = effective_downward_speed(state, config, now_s)
-    down_accel = max(0.0, vertical_accel_mps2(state))
-    alt_error = altitude_error_m(state, target_altitude_m, config, now_s)
-
-    if now_s - recovery_started_s < config.catch_duration_s and down_speed > 0.5:
-        thrust = (
-            config.hover_thrust
-            + max(0.0, alt_error) * config.altitude_gain
-            + down_speed * config.vertical_speed_gain
-            + down_accel * config.acceleration_gain
-        )
-        return clamp(max(thrust, config.catch_thrust), config.min_thrust, config.max_thrust)
-
-    thrust = (
-        config.hover_thrust
-        + alt_error * config.altitude_gain
-        + down_speed * config.vertical_speed_gain
-        + down_accel * config.acceleration_gain
-    )
-
-    if alt_error < 0.0 and down_speed < -config.runaway_up_speed_mps:
-        thrust -= abs(alt_error) * config.altitude_gain
-
-    return clamp(thrust, config.min_thrust, config.max_thrust)
-
-
-def send_level_setpoint(master, config: Config, thrust: float) -> None:
-    master.mav.set_attitude_target_send(
-        int(time.monotonic() * 1000.0) & 0xFFFFFFFF,
-        master.target_system,
-        master.target_component,
-        1 | 2 | 4,
-        [1.0, 0.0, 0.0, 0.0],
-        config.roll_rate_rad_s,
-        config.pitch_rate_rad_s,
-        config.yaw_rate_rad_s,
-        thrust,
-    )
-
-
-def request_offboard_mode(master) -> None:
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
@@ -152,356 +98,422 @@ def request_offboard_mode(master) -> None:
         0,
         float(arm.MAVLINK.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
         float(arm.PX4_CUSTOM_MAIN_MODE_OFFBOARD),
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        0,
+        0,
+        0,
+        0,
+        0,
     )
 
 
-def request_altctl_mode(master) -> None:
+def request_hold(master) -> None:
+    """Ask PX4 to enter Hold/Loiter mode after the emergency catch is stable enough."""
+
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
         arm.MAVLINK.MAV_CMD_DO_SET_MODE,
         0,
         float(arm.MAVLINK.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
-        float(arm.PX4_CUSTOM_MAIN_MODE_ALTCTL),
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        float(arm.PX4_CUSTOM_MAIN_MODE_AUTO),
+        float(arm.PX4_CUSTOM_SUB_MODE_AUTO_LOITER),
+        0,
+        0,
+        0,
+        0,
+    )
+
+
+def send_level_thrust(master, thrust: float) -> None:
+    """Send a level-attitude thrust setpoint for PX4 Offboard control."""
+
+    master.mav.set_attitude_target_send(
+        int(time.monotonic() * 1000) & 0xFFFFFFFF,
+        master.target_system,
+        master.target_component,
+        1 | 2 | 4,
+        [1.0, 0.0, 0.0, 0.0],
+        0,
+        0,
+        0,
+        thrust,
     )
 
 
 def offboard_active(state: arm.VehicleState) -> bool:
+    """Return True when PX4 reports Offboard mode."""
+
     return state.mode.upper() == "OFFBOARD"
 
 
-def altctl_active(state: arm.VehicleState) -> bool:
-    return state.mode.upper() in {"ALTCTL", "ALTITUDE", "ALTITUDE CONTROL"}
+def hold_active(state: arm.VehicleState) -> bool:
+    """Return True when PX4 reports a hold/loiter style mode."""
+
+    mode = state.mode.upper()
+    return mode in {"AUTO.LOITER", "HOLD", "LOITER"}
 
 
-def hover_state(state: arm.VehicleState, target_altitude_m: Optional[float], config: Config) -> str:
-    now_s = time.monotonic()
-    alt_ok = abs(altitude_error_m(state, target_altitude_m, config, now_s)) <= config.handoff_altitude_window_m
-    vertical_ok = state.downward_speed_mps is not None and abs(state.downward_speed_mps) <= config.handoff_vertical_speed_window_mps
-    ground_ok = state.ground_speed_mps is not None and state.ground_speed_mps <= config.handoff_ground_speed_window_mps
-    if state.armed and alt_ok and vertical_ok and ground_ok:
-        return "HOVER_STABLE"
-    if state.armed:
-        return "RECOVERING"
-    return "NOT_ARMED"
+def handoff_ready(
+    state: arm.VehicleState,
+    config: Config,
+    recovery_started_s: float,
+    now_s: float,
+) -> bool:
+    """Return True when recovery has slowed the vehicle enough to request PX4 Hold."""
 
-
-def armed_effective(state: arm.VehicleState, armed_latched_until_s: float, now_s: float) -> bool:
-    return state.armed or now_s <= armed_latched_until_s
-
-
-def handoff_ready(state: arm.VehicleState, target_altitude_m: Optional[float], config: Config) -> bool:
-    now_s = time.monotonic()
-    if not state.armed:
+    if not config.handoff_hold:
         return False
-    if not offboard_active(state):
+    if now_s - recovery_started_s < config.handoff_after_offboard_s:
         return False
-    if not velocity_fresh(state, config, now_s) or not altitude_fresh(state, config, now_s):
+    if not (state.armed or arm_accepted(state)):
         return False
-    if abs(altitude_error_m(state, target_altitude_m, config, now_s)) > config.handoff_altitude_window_m:
+    if (
+        state.downward_speed_mps is None
+        or state.altitude_m is None
+        or not arm.velocity_fresh(state, config, now_s)
+        or not arm.altitude_fresh(state, config, now_s)
+    ):
         return False
-    if state.downward_speed_mps is None or abs(state.downward_speed_mps) > config.handoff_vertical_speed_window_mps:
+    tilt = effective_tilt_deg(state, config, now_s)
+    body_rate_fn = getattr(arm, "max_body_rate_rad_s", None)
+    body_rate = body_rate_fn(state) if body_rate_fn is not None else None
+    if tilt is not None and tilt > config.handoff_max_tilt_deg:
         return False
-    if state.ground_speed_mps is None or state.ground_speed_mps > config.handoff_ground_speed_window_mps:
+    if body_rate is not None and body_rate > config.handoff_max_rate_rad_s:
         return False
-    return True
+    return (
+        config.handoff_climb_limit_mps <= state.downward_speed_mps <= config.handoff_vz_mps
+        and state.altitude_m >= config.handoff_min_altitude_m
+    )
 
 
-def phase_name(stage: str) -> str:
-    return f"phase={stage}"
+def ack_text(state: arm.VehicleState) -> str:
+    """Format the newest mode and arm command acknowledgements for logs."""
+
+    mode_ack = state.command_acks.get(arm.MAVLINK.MAV_CMD_DO_SET_MODE, "n/a")
+    arm_ack = state.command_acks.get(arm.MAVLINK.MAV_CMD_COMPONENT_ARM_DISARM, "n/a")
+    return f"ack(mode={mode_ack},arm={arm_ack})"
+
+
+def arm_accepted(state: arm.VehicleState) -> bool:
+    """Return True once PX4 has accepted our arm command."""
+
+    return state.command_acks.get(arm.MAVLINK.MAV_CMD_COMPONENT_ARM_DISARM) == arm.MAVLINK.MAV_RESULT_ACCEPTED
+
+
+def mode_ack_accepted_after(state: arm.VehicleState, command_time_s: Optional[float]) -> bool:
+    """Return True when a mode command ACK was accepted after the given request time."""
+
+    if command_time_s is None:
+        return False
+    return (
+        state.command_acks.get(arm.MAVLINK.MAV_CMD_DO_SET_MODE) == arm.MAVLINK.MAV_RESULT_ACCEPTED
+        and state.command_ack_times_s.get(arm.MAVLINK.MAV_CMD_DO_SET_MODE, 0.0) >= command_time_s
+    )
+
+
+def hold_heartbeat_after(state: arm.VehicleState, command_time_s: Optional[float]) -> bool:
+    """Return True when a fresh post-request heartbeat reports Hold/Loiter."""
+
+    if command_time_s is None or state.heartbeat_time_s is None:
+        return False
+    return state.heartbeat_time_s >= command_time_s and hold_active(state)
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    """Clamp a numeric value into a safe range."""
+
+    return max(low, min(high, value))
+
+
+def effective_tilt_deg(state: arm.VehicleState, config: Config, now_s: float) -> Optional[float]:
+    """Return real tilt, or a simulated tilt used only for bench-testing the gate."""
+
+    if config.simulated_tilt_deg is not None:
+        return config.simulated_tilt_deg
+    if not arm.attitude_fresh(state, config, now_s):
+        return None
+    return arm.tilt_deg(state)
+
+
+def attitude_thrust_cap(state: arm.VehicleState, config: Config, now_s: float) -> tuple[float, str]:
+    """Limit thrust while PX4 is still rotating the vehicle back toward level."""
+
+    tilt = effective_tilt_deg(state, config, now_s)
+    if tilt is None:
+        return config.max_thrust, "NO_ATTITUDE_LIMIT"
+    if tilt >= config.tilt_inverted_deg:
+        return config.tilt_inverted_thrust_cap, "LEVEL_INVERTED"
+    if tilt >= config.tilt_bad_deg:
+        return config.tilt_bad_thrust_cap, "LEVEL_BAD_TILT"
+    if tilt >= config.tilt_moderate_deg:
+        return config.tilt_moderate_thrust_cap, "LEVEL_LIMITED_TILT"
+    return config.max_thrust, "VERTICAL_RECOVERY"
 
 
 def print_status(
-    stage: str,
+    prefix: str,
     state: arm.VehicleState,
     config: Config,
-    now_s: float,
-    target_altitude_m: Optional[float],
-    thrust: Optional[float],
-    armed_override: Optional[bool] = None,
+    thrust: Optional[float] = None,
+    pid_output: Optional[float] = None,
+    reason: Optional[str] = None,
 ) -> None:
-    armed_now = state.armed if armed_override is None else armed_override
-    hover_text = hover_state(state, target_altitude_m, config)
-    if armed_override is True and hover_text == "NOT_ARMED":
-        hover_text = "RECOVERING"
-    line = (
-        f"{phase_name(stage)} hover_state={hover_text} "
-        f"{arm.status_line(state, config, now_s)} "
-        f"armed_effective={armed_now} "
-        f"target_alt_m={arm.format_number(target_altitude_m)} "
-        f"alt_err_m={altitude_error_m(state, target_altitude_m, config, now_s):.2f} "
-        f"vel_age={velocity_age_text(state, now_s)} "
-        f"last_text={arm.recent_status_text(state, now_s)}"
-    )
+    """Print one readable status line for wait, recovery, and handoff phases."""
+
+    now_s = time.monotonic()
+    accel = arm.vertical_accel_mps2(state)
+    line = f"{prefix} {arm.status_line(state, config, now_s)} {ack_text(state)}"
+    line += f" acc={arm.fmt(accel)}m/s2"
     if thrust is not None:
-        line += f" thrust_cmd={thrust:.2f}"
+        line += f" thrust={thrust:.2f}"
+    if pid_output is not None:
+        line += f" pid={pid_output:.2f} target_vz={config.target_vz_mps:.1f}m/s"
+    if reason is not None:
+        line += f" reason={reason}"
+    px4_text = arm.recent_status_text(state, now_s)
+    if px4_text != "none":
+        line += f" px4='{px4_text}'"
     print(line)
 
 
-def stream_recovery_cycle(master, state: arm.VehicleState, config: Config, recovery_started_s: float, target_altitude_m: Optional[float]) -> float:
-    now_s = time.monotonic()
-    thrust = thrust_command(state, config, recovery_started_s, now_s, target_altitude_m)
-    send_level_setpoint(master, config, thrust)
-    arm.update_state(master, state, config, timeout_s=0.0)
-    return thrust
+def build_pid(config: Config):
+    """Build the SimplePID controller that adjusts thrust from vertical speed."""
+
+    if PID is None:
+        raise RuntimeError("simple-pid is not installed. Run: pip install -r requirements.txt")
+    pid = PID(config.pid_kp, config.pid_ki, config.pid_kd, setpoint=config.target_vz_mps)
+    pid.output_limits = (config.min_thrust - config.recovery_thrust, config.max_thrust - config.recovery_thrust)
+    pid.sample_time = 0.0
+    return pid
 
 
-def prepare_stream(master, state: arm.VehicleState, config: Config, target_altitude_m: Optional[float]) -> None:
+def thrust_command(state: arm.VehicleState, config: Config, pid, started_s: float, now_s: float) -> tuple[float, float, str]:
+    """Convert vertical speed into a thrust command for the current recovery cycle."""
+
+    if not arm.velocity_fresh(state, config, now_s) or state.downward_speed_mps is None:
+        thrust = config.catch_thrust
+        cap, reason = attitude_thrust_cap(state, config, now_s)
+        thrust = min(thrust, cap)
+        return thrust, thrust - config.recovery_thrust, reason
+
+    if state.downward_speed_mps < -0.3:
+        pid.reset()
+        return config.min_thrust, config.min_thrust - config.recovery_thrust, "CUT_REBOUND"
+
+    pid_output = float(pid(-(state.downward_speed_mps)))
+    thrust = clamp(config.recovery_thrust + pid_output, config.min_thrust, config.max_thrust)
+    if now_s - started_s <= config.catch_duration_s and state.downward_speed_mps > 0.5:
+        thrust = max(thrust, config.catch_thrust)
+    cap, reason = attitude_thrust_cap(state, config, now_s)
+    thrust = min(thrust, cap)
+    return thrust, thrust - config.recovery_thrust, reason
+
+
+def recovery_loop(master, state: arm.VehicleState, config: Config) -> int:
+    """Main emergency loop: stream thrust, force-arm, request Offboard, then hand off."""
+
     interval_s = 1.0 / config.stream_rate_hz
-    deadline_s = time.monotonic() + config.prime_stream_s
     started_s = time.monotonic()
+    pid = build_pid(config)
     last_status_s = 0.0
-    last_offboard_request_s = 0.0
+    last_offboard_s = 0.0
+    last_arm_s = 0.0
+    handoff_requested_s: Optional[float] = None
+    handoff_ready_since_s: Optional[float] = None
+    last_handoff_s = 0.0
 
-    while time.monotonic() < deadline_s:
+    while time.monotonic() - started_s < config.recovery_duration_s:
+        cycle_s = time.monotonic()
+
+        # 1) Read fresh telemetry before computing the next command.
+        arm.update_state(master, state, config, timeout_s=min(0.01, interval_s * 0.5))
         now_s = time.monotonic()
-        thrust = stream_recovery_cycle(master, state, config, started_s, target_altitude_m)
-        if now_s - last_offboard_request_s >= config.offboard_retry_interval_s:
-            request_offboard_mode(master)
-            last_offboard_request_s = now_s
-        if now_s - last_status_s >= config.status_interval_s:
-            print_status("PREPARE", state, config, now_s, target_altitude_m, thrust)
-            last_status_s = now_s
-        time.sleep(interval_s)
 
+        if handoff_requested_s is not None and mode_ack_accepted_after(state, handoff_requested_s):
+            print_status("[handoff] HOLD command accepted; ending active recovery", state, config)
+            return 0
 
-def recover_and_handoff(master, state: arm.VehicleState, config: Config, target_altitude_m: Optional[float]) -> int:
-    interval_s = 1.0 / config.stream_rate_hz
-    recovery_started_s = time.monotonic()
-    offboard_deadline_s = recovery_started_s + config.offboard_timeout_s
-    recovery_deadline_s = None if config.recovery_duration_s <= 0 else recovery_started_s + config.recovery_duration_s
-    last_status_s = 0.0
-    last_offboard_request_s = 0.0
-    stable_since_s: Optional[float] = None
-    last_max_thrust_s: Optional[float] = None
-    last_rearm_attempt_s: Optional[float] = None
-    altctl_requested = False
-    armed_latched_until_s = recovery_started_s + config.arm_grace_s
-    target_source = state.altitude_source
+        if handoff_requested_s is not None and hold_heartbeat_after(state, handoff_requested_s):
+            print_status("[handoff] HOLD heartbeat confirmed", state, config)
+            return 0
 
-    while True:
-        now_s = time.monotonic()
-        thrust = stream_recovery_cycle(master, state, config, recovery_started_s, target_altitude_m)
+        if handoff_requested_s is not None and now_s - handoff_requested_s >= config.handoff_timeout_s:
+            print_status("[handoff] HOLD not heartbeat-confirmed yet; continuing recovery", state, config)
+            handoff_requested_s = None
 
-        if target_source != "LOCAL_POSITION_NED" and state.altitude_source == "LOCAL_POSITION_NED" and altitude_fresh(state, config, now_s):
-            target_altitude_m = state.altitude_m
-            target_source = state.altitude_source
-            print(f"target altitude recaptured from {target_source}: {arm.format_number(target_altitude_m)} m")
+        # 2) Compute and stream thrust every cycle so PX4 always has a fresh setpoint.
+        thrust, pid_output, reason = thrust_command(state, config, pid, started_s, now_s)
+        send_level_thrust(master, thrust)
 
-        if state.armed:
-            armed_latched_until_s = now_s + config.arm_grace_s
-
-        if thrust >= config.max_thrust - 1e-6:
-            last_max_thrust_s = last_max_thrust_s or now_s
+        # 3) Request Hold only after Offboard recovery has slowed the vehicle enough.
+        if handoff_ready(state, config, started_s, now_s):
+            handoff_ready_since_s = handoff_ready_since_s or now_s
         else:
-            last_max_thrust_s = None
+            handoff_ready_since_s = None
 
-        if not altctl_requested and now_s - last_offboard_request_s >= config.offboard_retry_interval_s:
-            request_offboard_mode(master)
-            last_offboard_request_s = now_s
+        if (
+            handoff_requested_s is None
+            and handoff_ready_since_s is not None
+            and now_s - handoff_ready_since_s >= config.handoff_dwell_s
+            and now_s - last_handoff_s >= config.handoff_retry_interval_s
+        ):
+            print_status("[handoff] requesting HOLD", state, config, thrust, pid_output, reason)
+            state.command_acks.pop(arm.MAVLINK.MAV_CMD_DO_SET_MODE, None)
+            state.command_ack_times_s.pop(arm.MAVLINK.MAV_CMD_DO_SET_MODE, None)
+            request_hold(master)
+            handoff_requested_s = now_s
+            last_handoff_s = now_s
 
-        if handoff_ready(state, target_altitude_m, config):
-            stable_since_s = stable_since_s or now_s
-        else:
-            stable_since_s = None
+        # 4) During the emergency window, keep retrying Offboard and force-arm.
+        in_initial_burst = now_s - started_s <= config.force_arm_burst_s
+        if (
+            handoff_requested_s is None
+            and now_s - last_offboard_s >= config.offboard_retry_interval_s
+            and (in_initial_burst or not offboard_active(state))
+        ):
+            request_offboard(master)
+            last_offboard_s = now_s
+        if now_s - last_arm_s >= config.arm_retry_interval_s and (in_initial_burst or not state.armed):
+            arm.send_arm_command(master, force=True)
+            last_arm_s = now_s
 
-        if stable_since_s is not None and now_s - stable_since_s >= config.handoff_dwell_s:
-            request_altctl_mode(master)
-            altctl_requested = True
-
-        if altctl_requested and altctl_active(state):
-            print("altctl accepted")
-            return monitor_altctl(master, state, config, target_altitude_m)
-
-        if not altctl_requested and now_s >= offboard_deadline_s and not offboard_active(state):
-            print("offboard not confirmed yet, still streaming and retrying")
-            offboard_deadline_s = now_s + 1.0
-
-        if last_max_thrust_s is not None and now_s - last_max_thrust_s >= config.max_thrust_warning_s:
-            if effective_downward_speed(state, config, now_s) > config.handoff_vertical_speed_window_mps:
-                print("warning: thrust saturated at max and descent is not yet under control")
-                last_max_thrust_s = now_s
-
+        # 5) Print a readable summary at human speed while the loop runs at stream_rate_hz.
         if now_s - last_status_s >= config.status_interval_s:
-            if altctl_requested:
-                stage = "ALTCTL_REQUEST"
-            elif now_s - recovery_started_s < config.catch_duration_s:
-                stage = "CATCH"
-            else:
-                stage = "STABILIZE"
-            print_status(
-                stage,
-                state,
-                config,
-                now_s,
-                target_altitude_m,
-                thrust,
-                armed_override=armed_effective(state, armed_latched_until_s, now_s),
-            )
+            print_status("[recover]", state, config, thrust, pid_output, reason)
             last_status_s = now_s
 
-        if not armed_effective(state, armed_latched_until_s, now_s):
-            within_grace = now_s - recovery_started_s <= config.arm_grace_s
-            still_falling = effective_downward_speed(state, config, now_s) >= config.freefall_speed_mps * 0.5
-            if within_grace or still_falling:
-                if last_rearm_attempt_s is None or now_s - last_rearm_attempt_s >= config.rearm_retry_interval_s:
-                    print("vehicle not armed yet, retrying force-arm while streaming")
-                    if arm.force_arm(master, state, config):
-                        armed_latched_until_s = time.monotonic() + config.arm_grace_s
-                    last_rearm_attempt_s = now_s
-            else:
-                print("vehicle disarmed, stopping recovery stream")
-                return 1
+        time.sleep(max(0.0, interval_s - (time.monotonic() - cycle_s)))
 
-        if recovery_deadline_s is not None and now_s >= recovery_deadline_s:
-            print("recovery duration reached, stopping recovery stream")
-            return 0
-
-        time.sleep(interval_s)
-
-
-def monitor_altctl(master, state: arm.VehicleState, config: Config, target_altitude_m: Optional[float]) -> int:
-    last_status_s = 0.0
-    deadline_s = None if config.recovery_duration_s <= 0 else time.monotonic() + config.recovery_duration_s
-
-    while True:
-        arm.update_state(master, state, config, timeout_s=0.1)
-        now_s = time.monotonic()
-
-        if now_s - last_status_s >= config.status_interval_s:
-            print_status("ALTCTL_HOLD", state, config, now_s, target_altitude_m, None)
-            last_status_s = now_s
-
-        if not state.armed:
-            print("vehicle disarmed, stopping monitor")
-            return 0
-
-        if not altctl_active(state):
-            print("altctl lost")
-            return 1
-
-        if deadline_s is not None and now_s >= deadline_s:
-            print("recovery duration reached, stopping monitor")
-            return 0
+    if handoff_requested_s is not None:
+        print_status("[done] recovery timeout while waiting for HOLD heartbeat confirmation", state, config)
+    else:
+        print_status("[done]", state, config)
+    return 0
 
 
 def run(config: Config) -> int:
-    master = arm.open_connection(config.connection)
+    """Connect, wait for freefall, and start the recovery loop."""
+
+    enable_logging(config)
+    master = arm.open_connection(config.connection, config.connection_timeout_s)
+    arm.request_basic_telemetry(master)
     state = arm.VehicleState()
     last_status_s = 0.0
-
-    print(f"freefall trigger: threshold={config.freefall_speed_mps:.2f}m/s duration={config.freefall_time_s:.2f}s")
     print(
-        "px4 setup assumptions: "
-        "COM_OF_LOSS_T long enough for recovery, "
-        "offboard-loss action not immediately unusable, "
-        "land/disarm logic not auto-disarming immediately after midair re-arm"
-    )
-    print(
-        "offboard recovery: "
-        f"catch_thrust={config.catch_thrust:.2f} "
-        f"hover_thrust={config.hover_thrust:.2f} "
-        f"alt_gain={config.altitude_gain:.3f} "
-        f"vs_gain={config.vertical_speed_gain:.3f} "
-        f"accel_gain={config.acceleration_gain:.3f}"
+        f"[setup] trigger={config.freefall_speed_mps:.1f}m/s for {config.freefall_time_s:.2f}s "
+        f"stream={config.stream_rate_hz:.0f}Hz base_thrust={config.recovery_thrust:.2f} "
+        f"pid=({config.pid_kp:.3f},{config.pid_ki:.3f},{config.pid_kd:.3f}) "
+        f"tilt_caps={config.tilt_moderate_deg:.0f}/{config.tilt_bad_deg:.0f}/{config.tilt_inverted_deg:.0f}deg "
+        f"handoff={'hold' if config.handoff_hold else 'off'} "
+        f"handoff_after_offboard={config.handoff_after_offboard_s:.2f}s "
+        f"handoff_vz=[{config.handoff_climb_limit_mps:.1f},{config.handoff_vz_mps:.1f}]m/s "
+        f"duration={config.recovery_duration_s:.1f}s"
     )
 
     while True:
-        arm.update_state(master, state, config, timeout_s=0.1)
+        send_level_thrust(master, config.recovery_thrust)
+        arm.update_state(master, state, config, timeout_s=0.05)
         now_s = time.monotonic()
-
         if now_s - last_status_s >= config.status_interval_s:
-            print_status("WAITING", state, config, now_s, None, None)
+            print_status("[wait]", state, config)
             last_status_s = now_s
-
-        if not arm.freefall_detected(state, config, now_s):
-            continue
-
-        print("trigger fired: freefall")
-        target_altitude_m, target_source = capture_target_altitude(state)
-        print(f"target altitude captured: {arm.format_number(target_altitude_m)} m source={target_source or 'none'}")
-
-        prepare_stream(master, state, config, target_altitude_m)
-
-        if state.altitude_source == "LOCAL_POSITION_NED" and arm.altitude_is_fresh(state, config, time.monotonic()):
-            target_altitude_m = state.altitude_m
-            print(f"target altitude refreshed before arm: {arm.format_number(target_altitude_m)} m source={state.altitude_source}")
-
-        print("phase=ARMING")
-        if not arm.force_arm(master, state, config):
-            return 1
-
-        print("recovery streaming active")
-        return recover_and_handoff(master, state, config, target_altitude_m)
+        if arm.freefall_detected(state, config, now_s):
+            print_status("[drop]", state, config)
+            return recovery_loop(master, state, config)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Simple PX4 offboard recovery with ALTCTL handoff.")
-    parser.add_argument("--connection", default=Config.connection, help="MAVLink connection string.")
-    parser.add_argument("--freefall-speed", type=float, default=Config.freefall_speed_mps, help="Downward speed threshold in m/s.")
-    parser.add_argument("--freefall-time", type=float, default=Config.freefall_time_s, help="Required freefall duration in seconds.")
-    parser.add_argument("--status-interval", type=float, default=Config.status_interval_s, help="Status print interval in seconds.")
-    parser.add_argument("--catch-thrust", type=float, default=Config.catch_thrust, help="Minimum thrust during the catch phase.")
-    parser.add_argument("--catch-duration", type=float, default=Config.catch_duration_s, help="How long to keep the stronger catch behavior.")
-    parser.add_argument("--hover-thrust", type=float, default=Config.hover_thrust, help="Base thrust after the catch phase.")
-    parser.add_argument("--min-thrust", type=float, default=Config.min_thrust, help="Minimum commanded thrust.")
-    parser.add_argument("--max-thrust", type=float, default=Config.max_thrust, help="Maximum commanded thrust.")
-    parser.add_argument("--altitude-gain", type=float, default=Config.altitude_gain, help="Extra thrust per meter below target altitude.")
-    parser.add_argument("--vertical-speed-gain", type=float, default=Config.vertical_speed_gain, help="Extra thrust per m/s of downward speed.")
-    parser.add_argument("--acceleration-gain", type=float, default=Config.acceleration_gain, help="Extra thrust when downward speed is still increasing.")
-    parser.add_argument("--stream-rate", type=float, default=Config.stream_rate_hz, help="Setpoint stream rate in Hz.")
-    parser.add_argument("--prime-stream", type=float, default=Config.prime_stream_s, help="How long to stream before arming.")
-    parser.add_argument("--offboard-retry-interval", type=float, default=Config.offboard_retry_interval_s, help="How often to re-request Offboard.")
-    parser.add_argument("--offboard-timeout", type=float, default=Config.offboard_timeout_s, help="How long to wait before warning that Offboard is still not confirmed.")
-    parser.add_argument("--rearm-retry-interval", type=float, default=Config.rearm_retry_interval_s, help="How often to retry force-arm if PX4 drops back to disarmed during the catch.")
-    parser.add_argument("--arm-grace", type=float, default=Config.arm_grace_s, help="How long to tolerate and retry an unarmed state right after recovery starts.")
-    parser.add_argument("--handoff-altitude-window", type=float, default=Config.handoff_altitude_window_m, help="Altitude error window for ALTCTL handoff.")
-    parser.add_argument("--handoff-vertical-speed-window", type=float, default=Config.handoff_vertical_speed_window_mps, help="Vertical speed window for ALTCTL handoff.")
-    parser.add_argument("--handoff-ground-speed-window", type=float, default=Config.handoff_ground_speed_window_mps, help="Ground speed window for ALTCTL handoff.")
-    parser.add_argument("--handoff-dwell", type=float, default=Config.handoff_dwell_s, help="How long stability must be held before ALTCTL request.")
-    parser.add_argument("--recovery-duration", type=float, default=Config.recovery_duration_s, help="How long to keep recovery or monitor active. Use 0 to hold until disarm/manual takeover.")
+    """Create the CLI for tuning the recovery script."""
+
+    parser = argparse.ArgumentParser(description="Minimal PX4 Offboard freefall recovery.")
+    parser.add_argument("--connection", default=Config.connection)
+    parser.add_argument("--freefall-speed", type=float, default=Config.freefall_speed_mps)
+    parser.add_argument("--freefall-time", type=float, default=Config.freefall_time_s)
+    parser.add_argument("--status-interval", type=float, default=Config.status_interval_s)
+    parser.add_argument("--stream-rate", type=float, default=Config.stream_rate_hz)
+    parser.add_argument("--recovery-thrust", "--base-thrust", type=float, default=Config.recovery_thrust)
+    parser.add_argument("--min-thrust", type=float, default=Config.min_thrust)
+    parser.add_argument("--max-thrust", type=float, default=Config.max_thrust)
+    parser.add_argument("--catch-thrust", type=float, default=Config.catch_thrust)
+    parser.add_argument("--catch-duration", type=float, default=Config.catch_duration_s)
+    parser.add_argument("--target-vz", type=float, default=Config.target_vz_mps)
+    parser.add_argument("--pid-kp", type=float, default=Config.pid_kp)
+    parser.add_argument("--pid-ki", type=float, default=Config.pid_ki)
+    parser.add_argument("--pid-kd", type=float, default=Config.pid_kd)
+    parser.add_argument("--recovery-duration", type=float, default=Config.recovery_duration_s)
+    parser.add_argument("--offboard-retry-interval", type=float, default=Config.offboard_retry_interval_s)
+    parser.add_argument("--arm-retry-interval", type=float, default=Config.arm_retry_interval_s)
+    parser.add_argument("--force-arm-burst", type=float, default=Config.force_arm_burst_s)
+    parser.add_argument("--tilt-moderate", type=float, default=Config.tilt_moderate_deg)
+    parser.add_argument("--tilt-bad", type=float, default=Config.tilt_bad_deg)
+    parser.add_argument("--tilt-inverted", type=float, default=Config.tilt_inverted_deg)
+    parser.add_argument("--tilt-moderate-thrust-cap", type=float, default=Config.tilt_moderate_thrust_cap)
+    parser.add_argument("--tilt-bad-thrust-cap", type=float, default=Config.tilt_bad_thrust_cap)
+    parser.add_argument("--tilt-inverted-thrust-cap", type=float, default=Config.tilt_inverted_thrust_cap)
+    parser.add_argument("--handoff-max-tilt", type=float, default=Config.handoff_max_tilt_deg)
+    parser.add_argument("--handoff-max-rate", type=float, default=Config.handoff_max_rate_rad_s)
+    parser.add_argument("--simulated-tilt-deg", type=float, default=None)
+    parser.add_argument("--no-handoff-hold", action="store_true")
+    parser.add_argument("--handoff-after-offboard", type=float, default=Config.handoff_after_offboard_s)
+    parser.add_argument("--handoff-vz", type=float, default=Config.handoff_vz_mps)
+    parser.add_argument("--handoff-climb-limit", type=float, default=Config.handoff_climb_limit_mps)
+    parser.add_argument("--handoff-dwell", type=float, default=Config.handoff_dwell_s)
+    parser.add_argument("--handoff-min-altitude", type=float, default=Config.handoff_min_altitude_m)
+    parser.add_argument("--handoff-timeout", type=float, default=Config.handoff_timeout_s)
+    parser.add_argument("--handoff-retry-interval", type=float, default=Config.handoff_retry_interval_s)
+    parser.add_argument("--log-dir", default=Config.log_dir)
+    parser.add_argument("--no-log", action="store_true")
     return parser
 
 
 def config_from_args(args: argparse.Namespace) -> Config:
+    """Convert parsed CLI arguments into Config."""
+
     return Config(
         connection=args.connection,
         freefall_speed_mps=args.freefall_speed,
         freefall_time_s=args.freefall_time,
         status_interval_s=args.status_interval,
-        catch_thrust=args.catch_thrust,
-        catch_duration_s=args.catch_duration,
-        hover_thrust=args.hover_thrust,
+        stream_rate_hz=args.stream_rate,
+        recovery_thrust=args.recovery_thrust,
         min_thrust=args.min_thrust,
         max_thrust=args.max_thrust,
-        altitude_gain=args.altitude_gain,
-        vertical_speed_gain=args.vertical_speed_gain,
-        acceleration_gain=args.acceleration_gain,
-        stream_rate_hz=args.stream_rate,
-        prime_stream_s=args.prime_stream,
-        offboard_retry_interval_s=args.offboard_retry_interval,
-        offboard_timeout_s=args.offboard_timeout,
-        rearm_retry_interval_s=args.rearm_retry_interval,
-        arm_grace_s=args.arm_grace,
-        handoff_altitude_window_m=args.handoff_altitude_window,
-        handoff_vertical_speed_window_mps=args.handoff_vertical_speed_window,
-        handoff_ground_speed_window_mps=args.handoff_ground_speed_window,
-        handoff_dwell_s=args.handoff_dwell,
+        catch_thrust=args.catch_thrust,
+        catch_duration_s=args.catch_duration,
+        target_vz_mps=args.target_vz,
+        pid_kp=args.pid_kp,
+        pid_ki=args.pid_ki,
+        pid_kd=args.pid_kd,
         recovery_duration_s=args.recovery_duration,
+        offboard_retry_interval_s=args.offboard_retry_interval,
+        arm_retry_interval_s=args.arm_retry_interval,
+        force_arm_burst_s=args.force_arm_burst,
+        tilt_moderate_deg=args.tilt_moderate,
+        tilt_bad_deg=args.tilt_bad,
+        tilt_inverted_deg=args.tilt_inverted,
+        tilt_moderate_thrust_cap=args.tilt_moderate_thrust_cap,
+        tilt_bad_thrust_cap=args.tilt_bad_thrust_cap,
+        tilt_inverted_thrust_cap=args.tilt_inverted_thrust_cap,
+        handoff_max_tilt_deg=args.handoff_max_tilt,
+        handoff_max_rate_rad_s=args.handoff_max_rate,
+        simulated_tilt_deg=args.simulated_tilt_deg,
+        handoff_hold=not args.no_handoff_hold,
+        handoff_after_offboard_s=args.handoff_after_offboard,
+        handoff_vz_mps=args.handoff_vz,
+        handoff_climb_limit_mps=args.handoff_climb_limit,
+        handoff_dwell_s=args.handoff_dwell,
+        handoff_min_altitude_m=args.handoff_min_altitude,
+        handoff_timeout_s=args.handoff_timeout,
+        handoff_retry_interval_s=args.handoff_retry_interval,
+        log_dir=args.log_dir,
+        no_log=args.no_log,
     )
 
 
 def cli() -> int:
+    """Command-line entry point."""
+
     return run(config_from_args(build_arg_parser().parse_args()))
 
 

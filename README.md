@@ -1,18 +1,59 @@
 # smartmobil-aerial-deployment
 
-Traceback (most recent call last):
-  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
-    return _run_code(code, main_globals, None,
-  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
-    exec(code, run_globals)
-  File "/home/bhmorela/px4_telem_plot/simple_hover.py", line 194, in <module>
-    raise SystemExit(cli())
-  File "/home/bhmorela/px4_telem_plot/simple_hover.py", line 190, in cli
-    return run(config_from_args(build_arg_parser().parse_args()))
-  File "/home/bhmorela/px4_telem_plot/simple_hover.py", line 148, in run
-    if not enter_offboard(master, state, config, recovery_started_s):
-  File "/home/bhmorela/px4_telem_plot/simple_hover.py", line 106, in enter_offboard
-    request_offboard_mode(master)
-  File "/home/bhmorela/px4_telem_plot/simple_hover.py", line 67, in request_offboard_mode
-    float(arm.MAVLINK.PX4_CUSTOM_MAIN_MODE_OFFBOARD),
-AttributeError: module 'pymavlink.dialects.v10.ardupilotmega' has no attribute 'PX4_CUSTOM_MAIN_MODE_OFFBOARD'
+Minimal PX4/Gazebo SITL scripts for testing freefall detection, force-arm, and
+Offboard setpoint streaming.
+
+## Active files
+
+- `simple_arm3.py` - MAVLink connection, telemetry parsing, freefall detection,
+  and force-arm helpers.
+- `simple_hover3.py` - waits for freefall, streams level attitude/thrust
+  setpoints, requests Offboard, retries force-arm, then asks PX4 Hold to take
+  over once descent has slowed.
+- `mavproxy.sh` - MAVProxy routing helper for WSL + QGC.
+
+## Run
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Start PX4 SITL and MAVProxy, then run:
+
+```bash
+python3 -m simple_hover3
+```
+
+Useful tuning flags:
+
+```bash
+python3 -m simple_hover3 --base-thrust 0.85 --pid-kp 0.05 --pid-ki 0.01 --recovery-duration 10
+```
+
+Logs are written to `logs/` unless `--no-log` is passed.
+
+The PID target is vertical speed near `0.0 m/s`. More downward velocity increases
+thrust; as the fall slows or turns into a climb, thrust decreases.
+
+By default, the script keeps streaming Offboard thrust first. It only requests
+PX4 Hold (`AUTO.LOITER`) after recovery has streamed for `0.5s`, arm has been
+accepted, altitude is above `10m`, and vertical speed has slowed into the
+`-3.0` to `2.0 m/s` handoff window. Preexisting Hold mode before the drop never
+counts as a successful handoff; the script must first stream recovery, pass the
+velocity gate, and explicitly request Hold. Tune that handoff window with:
+
+```bash
+python3 -m simple_hover3 --handoff-after-offboard 0.5 --handoff-vz 2.0 --handoff-climb-limit -3.0
+```
+
+If Hold is not heartbeat-confirmed, the script keeps recovery active and logs
+that it is still waiting/continuing. Use `--no-handoff-hold` to disable the
+handoff test.
+
+MAVProxy/QGC can show `LOITER` before the Python script sees the matching PX4
+heartbeat. The script now logs local-position age, velocity age, and heartbeat
+age separately, and it treats an accepted mode ACK after a Hold request as a
+successful active-recovery handoff. Treat the `mode=...` field, ACK lines, and
+MAVProxy's `Mode LOITER` line together when judging the handoff.
