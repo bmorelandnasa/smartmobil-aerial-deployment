@@ -34,6 +34,24 @@ python3 -m simple_hover3 --base-thrust 0.85 --pid-kp 0.05 --pid-ki 0.01 --recove
 
 Logs are written to `logs/` unless `--no-log` is passed.
 
+## Monte Carlo SITL batches
+
+Monte Carlo tooling lives in `monte_carlo/`. With PX4 SITL and MAVProxy running,
+try a dry run first:
+
+```bash
+python3 -m monte_carlo.sitl_driver --trials 3 --seed 42 --dry-run
+```
+
+For live trials, use:
+
+```bash
+python3 -m monte_carlo.sitl_driver --trials 5 --seed 42
+```
+
+Each batch writes a session folder under `logs/` with per-trial configs,
+supervisor logs, recovery logs, summaries, and a combined `results.csv`.
+
 The PID target is vertical speed near `0.0 m/s`. More downward velocity increases
 thrust; as the fall slows or turns into a climb, thrust decreases.
 

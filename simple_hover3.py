@@ -55,6 +55,9 @@ class Config(arm.Config):
     handoff_retry_interval_s: float = 0.3
     log_dir: str = "logs"
     no_log: bool = False
+    mc_initial_local_position_delay_s: float = 0.0
+    mc_heartbeat_gap_s: float = 0.0
+    mc_freefall_detection_delay_s: float = 0.0
 
 
 class Tee:
@@ -251,6 +254,39 @@ def attitude_thrust_cap(state: arm.VehicleState, config: Config, now_s: float) -
     return config.max_thrust, "VERTICAL_RECOVERY"
 
 
+def apply_initial_local_position_delay(
+    state: arm.VehicleState,
+    config: Config,
+    phase_started_s: float,
+    now_s: float,
+) -> None:
+    """Hide early local-position samples for Monte Carlo timing tests."""
+
+    if config.mc_initial_local_position_delay_s <= 0.0:
+        return
+    if now_s - phase_started_s > config.mc_initial_local_position_delay_s:
+        return
+    state.altitude_m = None
+    state.altitude_time_s = None
+    state.downward_speed_mps = None
+    state.velocity_time_s = None
+    state.speed_history.clear()
+
+
+def apply_heartbeat_gap(
+    state: arm.VehicleState,
+    config: Config,
+    phase_started_s: float,
+    now_s: float,
+) -> None:
+    """Hide an early heartbeat window for Monte Carlo timing tests."""
+
+    if config.mc_heartbeat_gap_s <= 0.0:
+        return
+    if now_s - phase_started_s <= config.mc_heartbeat_gap_s:
+        state.heartbeat_time_s = None
+
+
 def print_status(
     prefix: str,
     state: arm.VehicleState,
@@ -329,6 +365,7 @@ def recovery_loop(master, state: arm.VehicleState, config: Config) -> int:
         # 1) Read fresh telemetry before computing the next command.
         arm.update_state(master, state, config, timeout_s=min(0.01, interval_s * 0.5))
         now_s = time.monotonic()
+        apply_heartbeat_gap(state, config, started_s, now_s)
 
         if handoff_requested_s is not None and mode_ack_accepted_after(state, handoff_requested_s):
             print_status("[handoff] HOLD command accepted; ending active recovery", state, config)
@@ -399,6 +436,8 @@ def run(config: Config) -> int:
     master = arm.open_connection(config.connection, config.connection_timeout_s)
     arm.request_basic_telemetry(master)
     state = arm.VehicleState()
+    wait_started_s = time.monotonic()
+    freefall_seen_s: Optional[float] = None
     last_status_s = 0.0
     print(
         f"[setup] trigger={config.freefall_speed_mps:.1f}m/s for {config.freefall_time_s:.2f}s "
@@ -415,12 +454,17 @@ def run(config: Config) -> int:
         send_level_thrust(master, config.recovery_thrust)
         arm.update_state(master, state, config, timeout_s=0.05)
         now_s = time.monotonic()
+        apply_initial_local_position_delay(state, config, wait_started_s, now_s)
         if now_s - last_status_s >= config.status_interval_s:
             print_status("[wait]", state, config)
             last_status_s = now_s
         if arm.freefall_detected(state, config, now_s):
-            print_status("[drop]", state, config)
-            return recovery_loop(master, state, config)
+            freefall_seen_s = freefall_seen_s or now_s
+            if now_s - freefall_seen_s >= config.mc_freefall_detection_delay_s:
+                print_status("[drop]", state, config)
+                return recovery_loop(master, state, config)
+        else:
+            freefall_seen_s = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -430,6 +474,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--connection", default=Config.connection)
     parser.add_argument("--freefall-speed", type=float, default=Config.freefall_speed_mps)
     parser.add_argument("--freefall-time", type=float, default=Config.freefall_time_s)
+    parser.add_argument("--history-window", type=float, default=Config.history_window_s)
     parser.add_argument("--status-interval", type=float, default=Config.status_interval_s)
     parser.add_argument("--stream-rate", type=float, default=Config.stream_rate_hz)
     parser.add_argument("--recovery-thrust", "--base-thrust", type=float, default=Config.recovery_thrust)
@@ -464,6 +509,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--handoff-retry-interval", type=float, default=Config.handoff_retry_interval_s)
     parser.add_argument("--log-dir", default=Config.log_dir)
     parser.add_argument("--no-log", action="store_true")
+    parser.add_argument("--mc-initial-local-position-delay", type=float, default=Config.mc_initial_local_position_delay_s)
+    parser.add_argument("--mc-heartbeat-gap", type=float, default=Config.mc_heartbeat_gap_s)
+    parser.add_argument("--mc-freefall-detection-delay", type=float, default=Config.mc_freefall_detection_delay_s)
     return parser
 
 
@@ -474,6 +522,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         connection=args.connection,
         freefall_speed_mps=args.freefall_speed,
         freefall_time_s=args.freefall_time,
+        history_window_s=args.history_window,
         status_interval_s=args.status_interval,
         stream_rate_hz=args.stream_rate,
         recovery_thrust=args.recovery_thrust,
@@ -508,6 +557,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
         handoff_retry_interval_s=args.handoff_retry_interval,
         log_dir=args.log_dir,
         no_log=args.no_log,
+        mc_initial_local_position_delay_s=args.mc_initial_local_position_delay,
+        mc_heartbeat_gap_s=args.mc_heartbeat_gap,
+        mc_freefall_detection_delay_s=args.mc_freefall_detection_delay,
     )
 
 
