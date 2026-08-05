@@ -4,6 +4,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import os
 import subprocess
 import sys
 import time
@@ -83,6 +84,34 @@ def command_force_disarm(master) -> None:
     )
 
 
+def start_logged_process(label: str, command: str, cwd: Path, log_path: Path, new_console: bool = False) -> subprocess.Popen:
+    log = log_path.open("w", encoding="utf-8", buffering=1)
+    print(f"[{label}] command: {command}", file=log, flush=True)
+    flags = 0
+    if new_console and os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    return subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        shell=True,
+        text=True,
+        creationflags=flags,
+    )
+
+
+def stop_process(process: subprocess.Popen | None, timeout_s: float = 5.0) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout_s)
+
+
 def wait_for_altitude(
     master,
     state: arm.VehicleState,
@@ -141,6 +170,127 @@ def prepare_drop(master, state: arm.VehicleState, config: arm.Config, altitude_m
     else:
         print(f"[supervisor] takeoff altitude timeout; latest altitude={arm.fmt(state.altitude_m)}m", file=log, flush=True)
     return reached
+
+
+def stability_metrics(
+    master,
+    state: arm.VehicleState,
+    config: arm.Config,
+    process: subprocess.Popen,
+    drop_time_s: float,
+    trial_timeout_s: float,
+    stable_min_vz_mps: float,
+    stable_max_vz_mps: float,
+    stable_dwell_s: float,
+    log,
+) -> tuple[int | None, dict[str, float | bool | None]]:
+    deadline_s = drop_time_s + trial_timeout_s
+    stable_since_s = None
+    stable_recovery_time_s = None
+    min_local_altitude_m = None
+    max_downward_speed_mps = None
+
+    while time.monotonic() < deadline_s:
+        arm.update_state(master, state, config, timeout_s=0.05)
+        now_s = time.monotonic()
+
+        if state.altitude_m is not None and arm.altitude_fresh(state, config, now_s):
+            min_local_altitude_m = (
+                state.altitude_m
+                if min_local_altitude_m is None
+                else min(min_local_altitude_m, state.altitude_m)
+            )
+
+        if state.downward_speed_mps is not None and arm.velocity_fresh(state, config, now_s):
+            max_downward_speed_mps = (
+                state.downward_speed_mps
+                if max_downward_speed_mps is None
+                else max(max_downward_speed_mps, state.downward_speed_mps)
+            )
+            is_stable = (
+                stable_min_vz_mps <= state.downward_speed_mps <= stable_max_vz_mps
+                and state.altitude_m is not None
+                and state.altitude_m > 0.0
+            )
+            if is_stable:
+                stable_since_s = stable_since_s or now_s
+                if stable_recovery_time_s is None and now_s - stable_since_s >= stable_dwell_s:
+                    stable_recovery_time_s = stable_since_s - drop_time_s
+                    print(
+                        f"[supervisor] stable recovery dwell reached at {stable_recovery_time_s:.2f}s",
+                        file=log,
+                        flush=True,
+                    )
+            else:
+                stable_since_s = None
+
+        if process.poll() is not None:
+            return_code = process.returncode
+            handoff_time_s = time.monotonic() - drop_time_s if return_code == 0 else None
+            return return_code, {
+                "stable_recovery_time_s": stable_recovery_time_s,
+                "hold_handoff_time_s": handoff_time_s,
+                "time_to_recovery_s": stable_recovery_time_s,
+                "stable_recovered": stable_recovery_time_s is not None,
+                "supervisor_min_local_altitude_m": min_local_altitude_m,
+                "supervisor_max_downward_speed_mps": max_downward_speed_mps,
+            }
+
+    print("[supervisor] recovery process timed out; terminating", file=log, flush=True)
+    process.terminate()
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5.0)
+    return None, {
+        "stable_recovery_time_s": stable_recovery_time_s,
+        "hold_handoff_time_s": None,
+        "time_to_recovery_s": stable_recovery_time_s,
+        "stable_recovered": stable_recovery_time_s is not None,
+        "supervisor_min_local_altitude_m": min_local_altitude_m,
+        "supervisor_max_downward_speed_mps": max_downward_speed_mps,
+    }
+
+
+def wait_ready_on_ground(
+    master,
+    state: arm.VehicleState,
+    config: arm.Config,
+    timeout_s: float,
+    ground_altitude_m: float,
+    require_ready_text: bool,
+    log,
+) -> bool:
+    deadline_s = time.monotonic() + timeout_s
+    last_disarm_s = 0.0
+    last_log_s = 0.0
+
+    while time.monotonic() < deadline_s:
+        arm.update_state(master, state, config, timeout_s=0.1)
+        now_s = time.monotonic()
+        if now_s - last_disarm_s >= 1.0:
+            command_force_disarm(master)
+            last_disarm_s = now_s
+        if now_s - last_log_s >= 1.0:
+            print(
+                f"[supervisor] reset alt={arm.fmt(state.altitude_m)}m "
+                f"vz={arm.fmt(state.downward_speed_mps)}m/s armed={state.armed} "
+                f"status='{arm.recent_status_text(state, now_s)}'",
+                file=log,
+                flush=True,
+            )
+            last_log_s = now_s
+
+        local_ground = (
+            state.altitude_m is not None
+            and state.altitude_m <= ground_altitude_m
+            and arm.altitude_fresh(state, config, now_s)
+        )
+        ready_text = "ready to fly" in arm.recent_status_text(state, now_s).lower()
+        if local_ground and not state.armed and (ready_text or not require_ready_text):
+            return True
+    return False
 
 
 def build_recovery_command(args: argparse.Namespace, trial_dir: Path, sample) -> list[str]:
@@ -221,21 +371,39 @@ def run_trial(args: argparse.Namespace, session_dir: Path, master, state: arm.Ve
         time.sleep(args.recovery_warmup_s)
 
         print("[supervisor] force-disarming to create drop", file=log, flush=True)
+        drop_time_s = time.monotonic()
         command_force_disarm(master)
 
-        try:
-            return_code = process.wait(timeout=args.trial_timeout)
-        except subprocess.TimeoutExpired:
-            print("[supervisor] recovery process timed out; terminating", file=log, flush=True)
-            process.terminate()
-            return_code = None
+        return_code, timing = stability_metrics(
+            master,
+            state,
+            supervisor_config,
+            process,
+            drop_time_s,
+            args.trial_timeout,
+            args.stable_min_vz,
+            args.stable_max_vz,
+            args.stable_dwell,
+            log,
+        )
 
         parsed = parse_latest_recovery_log(trial_dir, ground_altitude_m=args.ground_altitude)
         summary = {
             **sample.to_dict(),
             **asdict(parsed),
+            **timing,
             "recovery_return_code": return_code,
         }
+        reset_ready = wait_ready_on_ground(
+            master,
+            state,
+            supervisor_config,
+            args.reset_timeout,
+            args.ground_altitude,
+            args.require_ready_text,
+            log,
+        )
+        summary["reset_ready"] = reset_ready
         write_json(trial_dir / "summary.json", summary)
         print(f"[supervisor] outcome={summary['outcome']} reason={summary['reason']}", file=log, flush=True)
         return summary
@@ -265,6 +433,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trial-timeout", type=float, default=30.0)
     parser.add_argument("--recovery-warmup-s", type=float, default=1.0)
     parser.add_argument("--ground-altitude", type=float, default=1.0)
+    parser.add_argument("--stable-min-vz", type=float, default=-0.5)
+    parser.add_argument("--stable-max-vz", type=float, default=1.0)
+    parser.add_argument("--stable-dwell", type=float, default=1.0)
+    parser.add_argument("--reset-timeout", type=float, default=30.0)
+    parser.add_argument("--require-ready-text", action="store_true")
+    parser.add_argument("--launch-stack", action="store_true")
+    parser.add_argument("--px4-dir", type=Path, default=None)
+    parser.add_argument("--px4-command", default="make HEADLESS=1 px4_sitl gz_x500")
+    parser.add_argument("--mavproxy-command", default="bash mavproxy.sh")
+    parser.add_argument("--stack-start-delay", type=float, default=8.0)
+    parser.add_argument("--new-console", action="store_true")
     parser.add_argument("--require-drop-altitude", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -285,22 +464,59 @@ def main() -> int:
             "recovery_connection": args.recovery_connection,
             "session_dir": str(session_dir),
             "dry_run": args.dry_run,
+            "launch_stack": args.launch_stack,
+            "px4_dir": str(args.px4_dir) if args.px4_dir is not None else None,
+            "px4_command": args.px4_command,
+            "mavproxy_command": args.mavproxy_command,
+            "stable_min_vz": args.stable_min_vz,
+            "stable_max_vz": args.stable_max_vz,
+            "stable_dwell": args.stable_dwell,
+            "reset_timeout": args.reset_timeout,
+            "require_ready_text": args.require_ready_text,
         },
     )
 
-    master = None
-    state = arm.VehicleState()
-    supervisor_config = arm.Config(connection=args.supervisor_connection)
-    if not args.dry_run:
-        master = arm.open_connection(args.supervisor_connection, supervisor_config.connection_timeout_s)
-        arm.request_basic_telemetry(master)
+    px4_process = None
+    mavproxy_process = None
+    try:
+        if args.launch_stack and not args.dry_run:
+            if args.px4_dir is None:
+                print("[monte-carlo] --px4-dir is required with --launch-stack", file=sys.stderr)
+                return 2
+            px4_process = start_logged_process(
+                "px4",
+                args.px4_command,
+                args.px4_dir,
+                session_dir / "px4.log",
+                new_console=args.new_console,
+            )
+            time.sleep(args.stack_start_delay)
+            mavproxy_process = start_logged_process(
+                "mavproxy",
+                args.mavproxy_command,
+                args.repo_root,
+                session_dir / "mavproxy.log",
+                new_console=args.new_console,
+            )
+            time.sleep(args.stack_start_delay)
 
-    rows: list[dict] = []
-    for index, seed in enumerate(seeds, start=1):
-        print(f"[monte-carlo] trial {index}/{args.trials} seed={seed}")
-        row = run_trial(args, session_dir, master, state, supervisor_config, index, seed)
-        rows.append(row)
-        append_results(session_dir / "results.csv", rows)
+        master = None
+        state = arm.VehicleState()
+        supervisor_config = arm.Config(connection=args.supervisor_connection)
+        if not args.dry_run:
+            master = arm.open_connection(args.supervisor_connection, supervisor_config.connection_timeout_s)
+            arm.request_basic_telemetry(master)
+
+        rows: list[dict] = []
+        for index, seed in enumerate(seeds, start=1):
+            print(f"[monte-carlo] trial {index}/{args.trials} seed={seed}")
+            row = run_trial(args, session_dir, master, state, supervisor_config, index, seed)
+            rows.append(row)
+            append_results(session_dir / "results.csv", rows)
+    finally:
+        if args.launch_stack:
+            stop_process(mavproxy_process)
+            stop_process(px4_process)
 
     print(f"[monte-carlo] results: {session_dir}")
     return 0

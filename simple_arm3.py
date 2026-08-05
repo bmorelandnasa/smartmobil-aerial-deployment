@@ -52,7 +52,7 @@ class Config:
     connection: str = "udpin:0.0.0.0:14560"
     connection_timeout_s: float = 8.0
     freefall_speed_mps: float = 2.0
-    freefall_time_s: float = 2.0
+    freefall_time_s: float = 0.15
     local_position_timeout_s: float = 0.5
     heartbeat_timeout_s: float = 2.0
     status_interval_s: float = 0.5
